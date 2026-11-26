@@ -243,12 +243,16 @@ def speak_and_listen(
         finally:
             wav_path.unlink(missing_ok=True)
     else:
+        # Wait if the device is finishing a previous stackchan_say before resuming silent listen.
+        with suppress(Exception):
+            if client.playback_status().get("playing"):
+                wait_for_playback_end(client, timeout_sec=20.0)
         with suppress(Exception):
             client.resume_listen()
 
-    deadline = time.monotonic() + listen_timeout
-    while time.monotonic() < deadline:
-        with suppress(Exception):
+    deadline = None if listen_timeout <= 0 else (time.monotonic() + listen_timeout)
+    while deadline is None or time.monotonic() < deadline:
+        try:
             ast = client.audio_status()
             if ast.get("ready"):
                 audio_data = client.get_audio()
@@ -264,7 +268,10 @@ def speak_and_listen(
                     if heard:
                         return heard, detected
                 client.resume_listen()
-        time.sleep(0.035)
+        except Exception:
+            time.sleep(0.4)
+            continue
+        time.sleep(0.05)
     return "", tts_lang
 
 
@@ -368,8 +375,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="StackChan voice chat loop using Gemini Interactions API")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Gemini model name")
     parser.add_argument("--lang", default="auto", help="Language code ('auto', 'es', 'en', etc.)")
-    parser.add_argument("--turns", type=int, default=100, help="Maximum conversation turns")
-    parser.add_argument("--listen-timeout", type=int, default=60, help="Seconds to wait for user speech")
+    parser.add_argument("--turns", type=int, default=0, help="Maximum conversation turns (0 = unlimited)")
+    parser.add_argument(
+        "--listen-timeout",
+        type=int,
+        default=0,
+        help="Seconds to wait for speech before prompting (0 = silent indefinite standby)",
+    )
+    parser.add_argument("--no-greeting", action="store_true", help="Skip the initial spoken greeting")
     parser.add_argument("--verbose", action="store_true", help="Also stream full per-turn transcript to stdout")
     return parser.parse_args()
 
@@ -412,7 +425,7 @@ def main() -> None:
 
         raw_lang = args.lang.strip().lower()
         active_lang = detect_os_language() if raw_lang in ("", "auto", "os") else raw_lang.split("-")[0]
-        next_say = localized_text(active_lang, "greeting")
+        next_say = "" if args.no_greeting else localized_text(active_lang, "greeting")
         previous_interaction_id: str | None = None
         history_model: str | None = None
         last_user = ""
@@ -423,8 +436,11 @@ def main() -> None:
         log_file.write(f"{time.strftime('%H:%M:%S')} {start_msg}\n")
         print(start_msg, flush=True)
 
-        for _turn in range(args.turns):
-            log_line(f"[StackChan ({active_lang})] {next_say}")
+        while args.turns <= 0 or completed_turns < args.turns:
+            if next_say:
+                log_line(f"[StackChan ({active_lang})] {next_say}")
+            else:
+                log_line(f"[stackchan_chat] Standby listening ({active_lang})...")
             heard, _detected_lang = speak_and_listen(
                 device_client,
                 config,
@@ -435,8 +451,11 @@ def main() -> None:
             )
 
             if not heard:
-                log_line("[stackchan_chat] No user response (timeout).")
-                next_say = localized_text(active_lang, "timeout")
+                if args.listen_timeout > 0:
+                    log_line("[stackchan_chat] No user response (timeout).")
+                    next_say = localized_text(active_lang, "timeout")
+                else:
+                    next_say = ""
                 continue
 
             completed_turns += 1

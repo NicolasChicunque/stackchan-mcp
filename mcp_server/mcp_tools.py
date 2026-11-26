@@ -483,7 +483,7 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
         text: str = "",
         lang: str = "es",
         timeout: int = 45,
-        gesture: str = "nod",
+        gesture: str = "",
         face: str = "happy",
     ) -> str:
         """Two-way voice turn: speak text aloud on Stack-chan (with optional
