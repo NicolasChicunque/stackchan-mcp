@@ -213,13 +213,16 @@ class StackchanClient:
             self._session.trust_env = False
             return self._session.request(method.upper(), url, **kwargs)
 
-    def play(self, wav_url: str) -> dict:
+    def play(self, wav_url: str, *, wait_reply: bool = False) -> dict:
         if self.config.transport == "relay":
             raise ValueError("Relay playback requires PCM upload, not a device-fetched WAV URL")
+        body: dict[str, Any] = {"voice_url": wav_url}
+        if wait_reply:
+            body["wait_reply"] = True
         return self.request(
             "post",
             f"{self.base_url}/play",
-            json_body={"voice_url": wav_url},
+            json_body=body,
             timeout=self.config.http_play_timeout,
         ).json()
 

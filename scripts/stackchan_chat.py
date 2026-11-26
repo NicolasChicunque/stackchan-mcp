@@ -170,10 +170,16 @@ def read_started_ms(client: StackchanClient) -> int | None:
         return None
 
 
-def play_with_retry(client: StackchanClient, url: str, attempts: int = 3) -> bool:
+def play_with_retry(
+    client: StackchanClient,
+    url: str,
+    attempts: int = 3,
+    *,
+    wait_reply: bool = False,
+) -> bool:
     for attempt in range(1, attempts + 1):
         try:
-            res = client.play(url)
+            res = client.play(url, wait_reply=wait_reply)
             if res.get("success", True):
                 return True
             print(f"[stackchan_chat] Play attempt {attempt}/{attempts} failed: {res}")
@@ -275,7 +281,15 @@ def speak_and_listen(
     return "", tts_lang
 
 
-def speak_only(client: StackchanClient, config, text: str, lang: str, face: str = "calm") -> None:
+def speak_only(
+    client: StackchanClient,
+    config,
+    text: str,
+    lang: str,
+    face: str = "calm",
+    *,
+    wait_reply: bool = False,
+) -> None:
     """Speak a final message without waiting for a reply."""
     with suppress(Exception):
         client.set_face(face)
@@ -287,7 +301,7 @@ def speak_only(client: StackchanClient, config, text: str, lang: str, face: str 
     try:
         url = audio_url(config.mac_ip, config.audio_serve_port, wav_path.name)
         baseline_started_ms = read_started_ms(client)
-        if play_with_retry(client, url):
+        if play_with_retry(client, url, wait_reply=wait_reply):
             wait_for_playback_end(client, timeout_sec=15.0, baseline_started_ms=baseline_started_ms)
     finally:
         wav_path.unlink(missing_ok=True)
@@ -463,7 +477,14 @@ def main() -> None:
             lowered = heard.lower()
 
             if any(phrase in lowered for phrase in _USER_ESCALATE_PHRASES):
-                speak_only(device_client, config, localized_text(active_lang, "escalate"), active_lang, face="thinking")
+                speak_only(
+                    device_client,
+                    config,
+                    localized_text(active_lang, "escalate"),
+                    active_lang,
+                    face="thinking",
+                    wait_reply=True,
+                )
                 log_line(f"[ESCALATED] Task: {heard}")
                 emit_escalation(heard, heard, active_lang, log_path, prev_user=last_user, prev_bot=last_bot)
                 sys.exit(0)
@@ -511,7 +532,7 @@ def main() -> None:
                 # Only use a clean, short prefix (≤ 80 chars) so the TTS never reads weird content.
                 spoken_prefix = clean_prefix if 0 < len(clean_prefix) <= 80 else ""
                 spoken = f"{spoken_prefix} {localized_text(active_lang, 'escalate')}".strip() if spoken_prefix else localized_text(active_lang, "escalate")
-                speak_only(device_client, config, spoken, active_lang, face="thinking")
+                speak_only(device_client, config, spoken, active_lang, face="thinking", wait_reply=True)
                 log_line(f"[ESCALATED] Task: {task}")
                 emit_escalation(task, heard, active_lang, log_path, prev_user=last_user, prev_bot=last_bot)
                 sys.exit(0)
