@@ -1,13 +1,15 @@
 """
-stackchan_live.py - Complementary Gemini Live API voice bridge for StackChan.
+stackchan_live.py - Primary Gemini Live API voice bridge for StackChan (with auto-fallback).
 
-Uses native audio-in / audio-out over Gemini 3.8 Live (`gemini-3.8-live`) with
-live HTTP WAV streaming so StackChan starts speaking as soon as the first audio
-chunk arrives (~2s) instead of waiting for the entire reply to finish buffering.
+Runs Gemini 3.8 Live (`gemini-3.8-live`) as the primary voice engine using native
+audio-in / audio-out over WebSockets + live HTTP/1.1 chunked WAV streaming to ESP32-S3.
+If Gemini Live fails to connect or encounters a runtime/quota error, it automatically
+falls back to `scripts/stackchan_chat.py` (`FREE 3.5 LITE` — local Faster-Whisper +
+Gemini 3.5 Flash-Lite + local Piper/Edge TTS) so voice chat never interrupts.
 
 Usage:
     cd D:\\StackChan\\stackchan-mcp
-    uv run python -u scripts/stackchan_live.py --lang es --voice Puck
+    uv run python -u scripts/stackchan_live.py --lang auto
 """
 
 import argparse
@@ -15,6 +17,7 @@ import asyncio
 import io
 import os
 import queue
+import subprocess
 import sys
 import time
 import uuid
@@ -42,11 +45,35 @@ DEFAULT_LIVE_MODEL = "gemini-3.8-live"
 
 LIVE_SYSTEM_INSTRUCTION = (
     "You are StackChan, a friendly desktop robot in real-time voice chat. "
-    "Keep replies concise (1-2 short natural sentences) in the user's spoken language. "
-    "If the user asks for code edits, file inspection, git/build commands, camera/hardware diagnostics, "
-    "or live web facts you cannot verify, IMMEDIATELY call the `escalate_to_engineer` tool with a concise "
-    "English summary of the request. If the user says goodbye / stop / terminamos, call `end_chat`."
+    "Keep replies concise (1-2 short natural sentences) in the user's spoken language, "
+    "staying in the active conversation language unless the user explicitly asks to switch. "
+    "TWO request types:\n"
+    "1. GENERAL (answer yourself): casual conversation, stable knowledge, opinions, jokes.\n"
+    "2. ESCALATE IMMEDIATELY: code edits, file/log inspection, git/build/flash commands, "
+    "camera/hardware diagnostics, or live/real-time/post-cutoff web facts you cannot verify. "
+    "To escalate, IMMEDIATELY call `escalate_to_engineer` with a concise English summary. "
+    "If the user says goodbye / stop / terminamos / chao, call `end_chat`."
 )
+
+
+def detect_os_language(default: str = "en") -> str:
+    """Detect the operating system UI language as a 2-letter ISO code."""
+    if sys.platform == "win32":
+        with suppress(Exception):
+            import ctypes
+            import locale
+
+            lcid = ctypes.windll.kernel32.GetUserDefaultUILanguage()
+            win_loc = locale.windows_locale.get(lcid, "")
+            if win_loc:
+                return win_loc.split("_")[0].split("-")[0].lower()
+    for env_key in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        val = (os.environ.get(env_key) or "").strip()
+        if val and val.lower() not in ("c", "posix"):
+            code = val.split(".")[0].split("_")[0].split("-")[0].lower()
+            if len(code) == 2 and code.isalpha():
+                return code
+    return default
 
 
 def wav_bytes_to_pcm16(wav_bytes: bytes) -> tuple[bytes, int]:
@@ -128,10 +155,10 @@ def listen_for_wav(client: StackchanClient, timeout_sec: float = 0.0) -> bytes:
     return b""
 
 
-def build_live_config(voice: str, lang: str = "auto", context: str = "") -> types.LiveConnectConfig:
+def build_live_config(voice: str, lang: str = "es", context: str = "") -> types.LiveConnectConfig:
     instr = LIVE_SYSTEM_INSTRUCTION
-    if lang and lang not in ("auto", "os"):
-        instr += f"\nRespond primarily in language code: {lang}."
+    if lang:
+        instr += f"\nActive conversation language: {lang}."
     if context:
         instr += f"\nRecent context from coding agent: {context}"
 
@@ -247,12 +274,11 @@ async def receive_and_stream_turn(
     return "".join(user_tx).strip(), "".join(bot_tx).strip(), escalated_task, end_requested, ttfa
 
 
-async def run_live_loop(args: argparse.Namespace) -> int:
+async def run_live_loop(args: argparse.Namespace, active_lang: str) -> int:
     config = load_config()
     api_key = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
     if not api_key:
-        print("[stackchan_live] ERROR: GEMINI_API_KEY not set in environment or .env.", flush=True)
-        return 2
+        raise RuntimeError("GEMINI_API_KEY not set in environment or .env")
 
     device = StackchanClient(config)
     live_port = start_live_audio_server()
@@ -264,22 +290,30 @@ async def run_live_loop(args: argparse.Namespace) -> int:
             device.resume_listen()
 
     genai_client = genai.Client(api_key=api_key, http_options={"api_version": "v1beta"})
-    live_cfg = build_live_config(args.voice, lang=args.lang, context=args.context)
+    live_cfg = build_live_config(args.voice, lang=active_lang, context=args.context)
+
+    if args.no_greeting:
+        with suppress(Exception):
+            if device.playback_status().get("playing"):
+                wait_for_playback_end(device, timeout_sec=20.0)
 
     with suppress(Exception):
         device.set_agent_mode("live", label="LIVE 3.8")
         device.set_face("calm")
 
-    print(f"[stackchan_live] Connecting to {args.model} (voice={args.voice}, lang={args.lang}, streaming=HTTP-WAV)...", flush=True)
+    print(
+        f"[stackchan_live] Connecting to {args.model} (voice={args.voice}, lang={active_lang}, port={live_port})...",
+        flush=True,
+    )
 
     async with genai_client.aio.live.connect(model=args.model, config=live_cfg) as session:
-        print("[stackchan_live] Connected! Live streaming session active.", flush=True)
+        print("[stackchan_live] Connected! LIVE 3.8 streaming session active.", flush=True)
 
         if not args.no_greeting:
             greet_prompt = (
-                "Saluda en una frase muy corta en español diciendo que ya está activo el audio en streaming con Gemini Live."
-                if args.lang in ("es", "auto")
-                else "Greet the user in one very short sentence saying live audio streaming with Gemini Live is ready."
+                "Saluda en una frase muy corta en español diciendo que ya estás listo en modo Gemini Live."
+                if active_lang == "es"
+                else f"Greet the user in one very short sentence in language '{active_lang}' saying Gemini Live is ready."
             )
             t0 = time.monotonic()
             await session.send_client_content(
@@ -338,7 +372,7 @@ async def run_live_loop(args: argparse.Namespace) -> int:
                 with suppress(Exception):
                     device.set_agent_mode("engineer")
                     device.set_face("thinking")
-                print(f"[Last User] {heard}", flush=True)
+                print(f"[Last User ({active_lang})] {heard}", flush=True)
                 print(f"[ESCALATED] Task: {escalated_task}", flush=True)
                 return 0
 
@@ -352,22 +386,43 @@ async def run_live_loop(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_fallback_chat(args: argparse.Namespace, active_lang: str, reason: str) -> int:
+    """Seamlessly hand off to stackchan_chat.py (FREE 3.5 LITE) if Gemini Live fails."""
+    print(f"[stackchan_live] Falling back to stackchan_chat.py (FREE 3.5 LITE): {reason}", flush=True)
+    fallback_script = Path(__file__).resolve().with_name("stackchan_chat.py")
+    cmd = [sys.executable, "-u", str(fallback_script), "--lang", active_lang]
+    if args.no_greeting:
+        cmd.append("--no-greeting")
+    if args.context:
+        cmd.extend(["--context", args.context])
+    if args.listen_timeout > 0:
+        cmd.extend(["--listen-timeout", str(int(args.listen_timeout))])
+    return subprocess.call(cmd)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="StackChan Gemini Live API voice bridge")
+    parser = argparse.ArgumentParser(description="StackChan primary Gemini Live voice bridge (with FREE 3.5 LITE fallback)")
     parser.add_argument("--model", default=DEFAULT_LIVE_MODEL)
     parser.add_argument("--voice", default="Puck")
     parser.add_argument("--lang", default="auto")
     parser.add_argument("--context", default="")
     parser.add_argument("--no-greeting", action="store_true")
+    parser.add_argument("--no-fallback", action="store_true", help="Disable automatic fallback to stackchan_chat.py")
     parser.add_argument("--max-turns", type=int, default=50)
     parser.add_argument("--listen-timeout", type=float, default=0.0)
     args = parser.parse_args()
 
+    raw_lang = args.lang.strip().lower()
+    active_lang = detect_os_language() if raw_lang in ("", "auto", "os") else raw_lang.split("-")[0]
+
     try:
-        rc = asyncio.run(run_live_loop(args))
+        rc = asyncio.run(run_live_loop(args, active_lang))
     except Exception as exc:
-        print(f"[stackchan_live] Live session error ({exc}); fallback to stackchan_chat.py recommended.", flush=True)
-        rc = 1
+        if args.no_fallback:
+            print(f"[stackchan_live] Live session error ({exc}).", flush=True)
+            rc = 1
+        else:
+            rc = run_fallback_chat(args, active_lang, str(exc))
     sys.exit(rc)
 
 
