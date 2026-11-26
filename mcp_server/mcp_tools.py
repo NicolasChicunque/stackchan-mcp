@@ -479,10 +479,16 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
             return f"❌ Error: {exc}"
 
     @mcp.tool()
-    def stackchan_converse(text: str = "", lang: str = "es", timeout: int = 45) -> str:
-        """Two-way voice turn: speak text aloud on Stack-chan (if non-empty),
-        wait for playback to finish, then listen for the user's spoken reply
-        and return the transcribed text in one single MCP call."""
+    def stackchan_converse(
+        text: str = "",
+        lang: str = "es",
+        timeout: int = 45,
+        gesture: str = "nod",
+        face: str = "happy",
+    ) -> str:
+        """Two-way voice turn: speak text aloud on Stack-chan (with optional
+        expression and head gesture in the same call), wait for playback to
+        finish, then listen for the user's spoken reply."""
         audit_tool_call("stackchan_converse", lang=lang, text_len=len(text), timeout=timeout)
         wait_limit = max(5, min(90, int(timeout)))
         try:
@@ -491,9 +497,19 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                     start_audio_server(config.audio_serve_port)
                 wav_path = audio_processing.generate_tts(text.strip(), lang, config)
                 url = audio_url(config.mac_ip, config.audio_serve_port, wav_path.name)
+                if face and face in VALID_FACES:
+                    try:
+                        client.set_face(face)
+                    except Exception:
+                        pass
                 res = client.play(url)
                 if not res.get("success"):
                     return f"❌ Play failed: {res}"
+                if gesture in {"nod", "shake", "home"}:
+                    try:
+                        client.gesture(gesture)
+                    except Exception:
+                        pass
 
                 play_deadline = time.monotonic() + 30.0
                 saw_playing = False
@@ -526,13 +542,13 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                             heard = (asr.get("text") or "").strip()
                             if heard:
                                 dur = float(asr.get("duration") or 0.0)
-                                return f'👂 Heard ({dur:.1f}s, {lang}): "{heard}"'
+                                return f'Heard ({dur:.1f}s): "{heard}"'
                         client.resume_listen()
                 except Exception:
                     pass
                 time.sleep(0.035)
 
-            return f"⏱️ No speech heard within {wait_limit}s."
+            return f"Timeout ({wait_limit}s)"
         except Exception as exc:
             return f"❌ Error: {exc}"
 
