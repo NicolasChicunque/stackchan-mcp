@@ -117,6 +117,8 @@ def curl_request(
 class StackchanClient:
     def __init__(self, config: StackchanConfig):
         self.config = config
+        self._session = requests.Session()
+        self._session.trust_env = False
         if config.transport not in {"direct", "relay"}:
             raise ValueError("STACKCHAN_TRANSPORT must be direct or relay")
         if config.transport == "relay":
@@ -194,7 +196,6 @@ class StackchanClient:
                 headers=headers,
                 disable_config=not allow_redirects,
             )
-        request_method = getattr(requests, method.lower())
         kwargs: dict[str, Any] = {"timeout": timeout}
         if not allow_redirects:
             kwargs["allow_redirects"] = False
@@ -204,7 +205,13 @@ class StackchanClient:
             kwargs["data"] = data
         if headers is not None:
             kwargs["headers"] = headers
-        return request_method(url, **kwargs)
+        try:
+            return self._session.request(method.upper(), url, **kwargs)
+        except requests.ConnectionError:
+            self._session.close()
+            self._session = requests.Session()
+            self._session.trust_env = False
+            return self._session.request(method.upper(), url, **kwargs)
 
     def play(self, wav_url: str) -> dict:
         if self.config.transport == "relay":
@@ -268,6 +275,14 @@ class StackchanClient:
             f"{self.base_url}/audio/status",
             timeout=self.config.http_status_timeout if timeout is None else timeout,
         ).json()
+
+    def resume_listen(self) -> None:
+        with suppress(Exception):
+            self.request(
+                "post",
+                f"{self.base_url}/listen/resume",
+                timeout=1.5,
+            )
 
     def get_booth_mode(self) -> dict:
         """Read booth status without changing capture or consuming recorded audio."""

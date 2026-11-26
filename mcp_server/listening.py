@@ -12,24 +12,24 @@ def capture_ready_recording(
     client: StackchanClient,
     config: StackchanConfig,
     *,
-    lang: str = "zh",
+    lang: str = "es",
     audio_dir: Path = AUDIO_DIR,
+    wait_seconds: float = 15.0,
 ) -> dict[str, Any]:
-    """Consume and transcribe the current recording only when the device says it is ready."""
+    deadline = time.monotonic() + wait_seconds
     status = client.audio_status()
+    while not status.get("ready") and time.monotonic() < deadline:
+        time.sleep(0.4)
+        try:
+            status = client.audio_status()
+        except Exception:
+            pass
+
     if not status.get("ready"):
         return {
             "ready": False,
             "consumed": False,
             "status": status,
-        }
-
-    if not config.fish_audio_key:
-        return {
-            "ready": True,
-            "consumed": False,
-            "status": status,
-            "error": "Fish Audio key is not configured; set FISH_AUDIO_KEY before consuming audio.",
         }
 
     audio_data = client.get_audio()

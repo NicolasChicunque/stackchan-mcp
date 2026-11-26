@@ -12,6 +12,11 @@ logger = logging.getLogger(__name__)
 
 def load_dotenv(path: Path | None = None) -> None:
     """Load project .env so launchd and direct shell starts share one config."""
+    for _p in (Path(os.path.expanduser("~")) / "AppData/Local/Microsoft/WinGet/Packages/Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe/ffmpeg-9.0.2-full_build/bin",):
+        if _p.is_dir() and str(_p) not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = f"{_p};{os.environ.get('PATH', '')}"
+    if (extra := os.environ.get("PATH_EXTRA")) and extra not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = f"{extra};{os.environ.get('PATH', '')}"
     env_path = path or (Path(__file__).resolve().parents[1] / ".env")
     if not env_path.exists():
         return
@@ -138,6 +143,8 @@ class StackchanConfig:
     fish_audio_key: str
     fish_audio_model_zh: str
     fish_audio_model_en: str
+    edge_tts_rate: str = "+10%"
+    edge_tts_pitch: str = "+15Hz"
     mcp_auth_token: str = ""
     audio_publish_target: str = ""
     audio_publish_timeout: float = 20.0
@@ -173,6 +180,11 @@ VALID_FACES = ("calm", "thinking", "happy", "sleepy", "shy", "smug", "pouty")
 EDGE_VOICES = {
     "zh": "zh-CN-YunxiNeural",
     "en": "en-US-GuyNeural",
+    "es": os.environ.get("STACKCHAN_EDGE_VOICE_ES", "es-US-PalomaNeural"),
+    "es-US": "es-US-PalomaNeural",
+    "es-CO": "es-CO-SalomeNeural",
+    "es-MX": "es-MX-DaliaNeural",
+    "es-ES": "es-ES-ElviraNeural",
 }
 
 
@@ -406,6 +418,8 @@ def load_config() -> StackchanConfig:
             1024 * 1024,
         ),
         edge_tts_bin=os.environ.get("EDGE_TTS_BIN", "edge-tts"),
+        edge_tts_rate=os.environ.get("EDGE_TTS_RATE", "+10%"),
+        edge_tts_pitch=os.environ.get("EDGE_TTS_PITCH", "+15Hz"),
         fish_audio_key=os.environ.get("FISH_AUDIO_KEY", ""),
         fish_audio_model_zh=os.environ.get("FISH_AUDIO_MODEL_ZH", ""),
         fish_audio_model_en=os.environ.get("FISH_AUDIO_MODEL_EN", ""),
