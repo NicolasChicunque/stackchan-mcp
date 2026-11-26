@@ -484,6 +484,10 @@ def main() -> None:
         start_msg = f"[stackchan_chat] Started (model={args.model}, lang={active_lang}, requested={args.lang}, log={log_path})"
         log_file.write(f"{time.strftime('%H:%M:%S')} {start_msg}\n")
         print(start_msg, flush=True)
+        if args.no_greeting:
+            with suppress(Exception):
+                if device_client.playback_status().get("playing"):
+                    wait_for_playback_end(device_client, timeout_sec=20.0)
         device_client.set_agent_mode("free")
 
         while args.turns <= 0 or completed_turns < args.turns:
@@ -513,7 +517,6 @@ def main() -> None:
             lowered = heard.lower()
 
             if any(phrase in lowered for phrase in _USER_ESCALATE_PHRASES):
-                device_client.set_agent_mode("engineer")
                 speak_only(
                     device_client,
                     config,
@@ -522,6 +525,7 @@ def main() -> None:
                     face="thinking",
                     wait_reply=True,
                 )
+                device_client.set_agent_mode("engineer")
                 log_line(f"[ESCALATED] Task: {heard}")
                 emit_escalation(heard, heard, active_lang, log_path, prev_user=last_user, prev_bot=last_bot)
                 sys.exit(0)
@@ -567,7 +571,6 @@ def main() -> None:
 
             escalate_match = _ESCALATE_RE.search(reply)
             if escalate_match:
-                device_client.set_agent_mode("engineer")
                 task = escalate_match.group(1).strip()
                 # Only speak a prefix if it comes BEFORE the escalate marker and contains no escalation text.
                 raw_prefix = reply[: escalate_match.start()].strip()
@@ -577,6 +580,7 @@ def main() -> None:
                 spoken_prefix = clean_prefix if 0 < len(clean_prefix) <= 80 else ""
                 spoken = f"{spoken_prefix} {localized_text(active_lang, 'escalate')}".strip() if spoken_prefix else localized_text(active_lang, "escalate")
                 speak_only(device_client, config, spoken, active_lang, face="thinking", wait_reply=True)
+                device_client.set_agent_mode("engineer")
                 log_line(f"[ESCALATED] Task: {task}")
                 emit_escalation(task, heard, active_lang, log_path, prev_user=last_user, prev_bot=last_bot)
                 sys.exit(0)
