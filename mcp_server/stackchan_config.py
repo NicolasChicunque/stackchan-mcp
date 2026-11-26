@@ -40,6 +40,8 @@ def load_dotenv(path: Path | None = None) -> None:
         except ValueError:
             value = value.strip().strip("'\"")
         os.environ[key] = value
+    if "EDGE_VOICES" in globals() and os.environ.get("STACKCHAN_EDGE_VOICE_ES"):
+        EDGE_VOICES["es"] = os.environ["STACKCHAN_EDGE_VOICE_ES"]
 
 
 def env_float(name: str, default: float) -> float:
