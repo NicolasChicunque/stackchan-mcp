@@ -90,7 +90,12 @@ def speak_on_robot(
         with suppress(Exception):
             baseline = client.playback_status().get("started_ms")
         url = audio_url(config.mac_ip, live_port, f"live/{stream_id}")
-        client.play(url, wait_reply=wait_reply)
+        client.request(
+            "post",
+            f"{client.base_url}/play",
+            json_body={"voice_url": url, "wait_reply": wait_reply, "subtitle": text.strip()},
+            timeout=5.0,
+        )
         _wait_playback_end(client, baseline)
     finally:
         wav_path.unlink(missing_ok=True)
