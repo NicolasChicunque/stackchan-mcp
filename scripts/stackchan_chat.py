@@ -216,7 +216,7 @@ def speak_and_listen(
     asr_lang: str,
     listen_timeout: int = 60,
     face: str = "happy",
-    gesture: str = "nod",
+    gesture: str = "",
 ) -> tuple[str, str]:
     """Speak `text` in `tts_lang`, wait for playback, and listen for the user's reply."""
     if text:
