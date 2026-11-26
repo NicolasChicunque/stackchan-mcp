@@ -398,6 +398,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-greeting", action="store_true", help="Skip the initial spoken greeting")
     parser.add_argument(
+        "--context",
+        default="",
+        help="Optional 1-line handoff summary from the coding agent, injected into the first Gemini turn",
+    )
+    parser.add_argument(
         "--wait-reply",
         action="store_true",
         help="Single-turn engineer follow-up mode: optionally speak --say, then wait indefinitely for one reply and exit",
@@ -469,6 +474,7 @@ def main() -> None:
                 print(msg, flush=True)
 
         next_say = "" if args.no_greeting else localized_text(active_lang, "greeting")
+        pending_context = args.context.strip()
         previous_interaction_id: str | None = None
         history_model: str | None = None
         last_user = ""
@@ -536,6 +542,11 @@ def main() -> None:
                 log_line("[stackchan_chat] Recent year detected, injecting cutoff note.")
             else:
                 prompt_text = heard
+
+            if pending_context:
+                prompt_text = f"[Recent context from coding agent: {pending_context}]\nUser: {prompt_text}"
+                log_line(f"[stackchan_chat] Injected handoff context: {pending_context}")
+                pending_context = ""
 
             with suppress(Exception):
                 device_client.set_face("thinking")
