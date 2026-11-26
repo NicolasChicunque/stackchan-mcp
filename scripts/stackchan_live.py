@@ -457,21 +457,35 @@ async def run_live_loop(args: argparse.Namespace, active_lang: str) -> int:
                         else "Handing this over to the lead engineer."
                     )
                     if not spoken:
+                        spoke_live = False
                         try:
-                            await session.send_tool_response(
-                                function_responses=[
-                                    types.FunctionResponse(
-                                        id=tool_call_id,
-                                        name="escalate_to_engineer",
-                                        response={"say_now": handoff_msg},
-                                    )
-                                ]
+                            if tool_call_id:
+                                await session.send_tool_response(
+                                    function_responses=[
+                                        types.FunctionResponse(
+                                            id=tool_call_id,
+                                            name="escalate_to_engineer",
+                                            response={"status": "ok"},
+                                        )
+                                    ]
+                                )
+                            say_prompt = (
+                                f"Di exactamente esta frase corta en español y nada más: {handoff_msg}"
+                                if active_lang == "es"
+                                else f"Say ONLY this exact short sentence and nothing else: {handoff_msg}"
                             )
-                            await asyncio.wait_for(
+                            await session.send_client_content(
+                                turns=types.Content(role="user", parts=[types.Part(text=say_prompt)]),
+                                turn_complete=True,
+                            )
+                            _h2, s2, _e2, _id2, _end2, ttfa2 = await asyncio.wait_for(
                                 receive_and_stream_turn(session, device, config, live_port, time.monotonic(), wait_reply=True),
                                 timeout=12.0,
                             )
+                            spoke_live = bool(s2 or ttfa2 is not None)
                         except Exception:
+                            spoke_live = False
+                        if not spoke_live:
                             await asyncio.to_thread(
                                 speak_local_phrase,
                                 device,
@@ -496,21 +510,35 @@ async def run_live_loop(args: argparse.Namespace, active_lang: str) -> int:
                         else "Alright, ending the chat. See you later!"
                     )
                     if not spoken:
+                        spoke_live = False
                         try:
-                            await session.send_tool_response(
-                                function_responses=[
-                                    types.FunctionResponse(
-                                        id=tool_call_id,
-                                        name="end_chat",
-                                        response={"say_now": bye_msg},
-                                    )
-                                ]
+                            if tool_call_id:
+                                await session.send_tool_response(
+                                    function_responses=[
+                                        types.FunctionResponse(
+                                            id=tool_call_id,
+                                            name="end_chat",
+                                            response={"status": "ok"},
+                                        )
+                                    ]
+                                )
+                            say_prompt = (
+                                f"Di exactamente esta frase corta en español y nada más: {bye_msg}"
+                                if active_lang == "es"
+                                else f"Say ONLY this exact short sentence and nothing else: {bye_msg}"
                             )
-                            await asyncio.wait_for(
+                            await session.send_client_content(
+                                turns=types.Content(role="user", parts=[types.Part(text=say_prompt)]),
+                                turn_complete=True,
+                            )
+                            _h2, s2, _e2, _id2, _end2, ttfa2 = await asyncio.wait_for(
                                 receive_and_stream_turn(session, device, config, live_port, time.monotonic(), wait_reply=False),
                                 timeout=12.0,
                             )
+                            spoke_live = bool(s2 or ttfa2 is not None)
                         except Exception:
+                            spoke_live = False
+                        if not spoke_live:
                             await asyncio.to_thread(
                                 speak_local_phrase,
                                 device,
