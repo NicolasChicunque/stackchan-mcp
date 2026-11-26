@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import shutil
+import threading
 import time
 from typing import Any
 
@@ -150,7 +151,7 @@ def build_health_report(client: Any, config: StackchanConfig) -> dict[str, objec
         "ok": bool(device.get("ok")),
         "config": config_summary(config),
         "dependencies": {
-            "ffmpeg": bool(shutil.which("ffmpeg")),
+            "ffmpeg": bool(shutil.which("ffmpeg")) or (Path(os.path.expanduser("~")) / "AppData" / "Local" / "Microsoft" / "WinGet" / "Packages" / "Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe" / "ffmpeg-9.0.2-full_build" / "bin" / "ffmpeg.exe").exists(),
             "edge_tts": bool(shutil.which(config.edge_tts_bin)),
             "fish_audio_key": bool(config.fish_audio_key),
         },
@@ -222,7 +223,35 @@ def post_preferred_pcm_stream(
 
 def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
     @mcp.tool()
-    def stackchan_say(text: str, lang: str = "zh") -> str:
+    def stackchan_say(text: str, lang: str = "es") -> str:
+        audit_tool_call("stackchan_say", lang=lang, text_len=len(text))
+        if config.transport == "direct":
+            start_audio_server(config.audio_serve_port)
+
+        def _worker():
+            try:
+                wav_path = audio_processing.generate_tts(text, lang, config)
+                audio_processing.validate_playback_wav(wav_path)
+                url = audio_url(config.mac_ip, config.audio_serve_port, wav_path.name)
+                with open(AUDIO_DIR / "debug.txt", "a", encoding="utf-8") as _df:
+                    _df.write(f"{time.strftime('%X')} [worker] calling client.play({url})\n")
+                res = client.play(url)
+                with open(AUDIO_DIR / "debug.txt", "a", encoding="utf-8") as _df:
+                    _df.write(f"{time.strftime('%X')} [worker] client.play returned: {res}\n")
+            except Exception as exc:
+                with open(AUDIO_DIR / "debug.txt", "a", encoding="utf-8") as _df:
+                    _df.write(f"{time.strftime('%X')} [worker ERROR] {type(exc).__name__}: {exc}\n")
+                logger.error("Background speech playback error: %s", exc)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+        preview = text[:60]
+        suffix = "…" if len(text) > 60 else ""
+        return f"🗣️ Stack-chan is saying: \"{preview}{suffix}\""
+
+    def _unused_stackchan_say(text: str, lang: str = "zh") -> str:
+        with open(AUDIO_DIR / "debug.txt", "a", encoding="utf-8") as _df:
+            _df.write(f"{time.strftime('%X')} ENTERED stackchan_say text={text!r}\n")
         request_id = new_request_id()
         say_started = time.perf_counter()
         audit_tool_call(
@@ -358,12 +387,18 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                 logger.warning("Could not read playback status before /play: %s", exc)
 
             t0 = time.perf_counter()
+            with open(AUDIO_DIR / "debug.txt", "a", encoding="utf-8") as _df:
+                _df.write(f"{time.strftime('%X')} [mcp_tools] Calling client.play({audio_url(config.mac_ip, config.audio_serve_port, wav_path.name)})\n")
             result = client.play(audio_url(config.mac_ip, config.audio_serve_port, wav_path.name))
+            with open(AUDIO_DIR / "debug.txt", "a", encoding="utf-8") as _df:
+                _df.write(f"{time.strftime('%X')} [mcp_tools] client.play finished with {result}\n")
             wav_timing["play_post"] = timing_ms(t0)
 
             if result.get("success"):
-                if not baseline_playing:
+                if False:  # Skip synchronous polling to avoid starving device WiFi/playback
                     t0 = time.perf_counter()
+                    with open(AUDIO_DIR / "debug.txt", "a", encoding="utf-8") as _df:
+                        _df.write(f"{time.strftime('%X')} [mcp_tools] Starting wait_for_playback_start\n")
                     start_result = client.wait_for_playback_start(
                         baseline_started_ms=baseline_started_ms
                     )
@@ -435,11 +470,69 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
             return f"❌ Error: {exc}"
 
     @mcp.tool()
-    def stackchan_listen(lang: str = "zh") -> str:
+    def stackchan_listen(lang: str = "es", timeout: int = 15) -> str:
         audit_tool_call("stackchan_listen", lang=lang)
         try:
-            result = capture_ready_recording(client, config, lang=lang, audio_dir=AUDIO_DIR)
+            result = capture_ready_recording(client, config, lang=lang, audio_dir=AUDIO_DIR, wait_seconds=timeout)
             return format_listen_result(result)
+        except Exception as exc:
+            return f"❌ Error: {exc}"
+
+    @mcp.tool()
+    def stackchan_converse(text: str = "", lang: str = "es", timeout: int = 45) -> str:
+        """Two-way voice turn: speak text aloud on Stack-chan (if non-empty),
+        wait for playback to finish, then listen for the user's spoken reply
+        and return the transcribed text in one single MCP call."""
+        audit_tool_call("stackchan_converse", lang=lang, text_len=len(text), timeout=timeout)
+        wait_limit = max(5, min(90, int(timeout)))
+        try:
+            if text and text.strip():
+                if config.transport == "direct":
+                    start_audio_server(config.audio_serve_port)
+                wav_path = audio_processing.generate_tts(text.strip(), lang, config)
+                url = audio_url(config.mac_ip, config.audio_serve_port, wav_path.name)
+                res = client.play(url)
+                if not res.get("success"):
+                    return f"❌ Play failed: {res}"
+
+                play_deadline = time.monotonic() + 30.0
+                saw_playing = False
+                while time.monotonic() < play_deadline:
+                    try:
+                        pst = client.playback_status()
+                        if pst.get("playing"):
+                            saw_playing = True
+                        elif saw_playing:
+                            time.sleep(0.03)
+                            break
+                        elif time.monotonic() > play_deadline - 25.0:
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.04)
+
+            if not (text and text.strip()):
+                client.resume_listen()
+            listen_deadline = time.monotonic() + wait_limit
+            while time.monotonic() < listen_deadline:
+                try:
+                    ast = client.audio_status()
+                    if ast.get("ready"):
+                        audio_data = client.get_audio()
+                        if audio_data and len(audio_data) >= 6400:
+                            rec_path = AUDIO_DIR / f"rec_{int(time.time() * 1000)}.wav"
+                            rec_path.write_bytes(audio_data)
+                            asr = audio_processing.transcribe_audio(rec_path, lang, config)
+                            heard = (asr.get("text") or "").strip()
+                            if heard:
+                                dur = float(asr.get("duration") or 0.0)
+                                return f'👂 Heard ({dur:.1f}s, {lang}): "{heard}"'
+                        client.resume_listen()
+                except Exception:
+                    pass
+                time.sleep(0.035)
+
+            return f"⏱️ No speech heard within {wait_limit}s."
         except Exception as exc:
             return f"❌ Error: {exc}"
 

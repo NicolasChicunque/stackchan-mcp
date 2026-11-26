@@ -10,12 +10,14 @@ import hmac
 import json
 import os
 import sys
+import threading
 
 from mcp.server.fastmcp import FastMCP, Image
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from . import audio_processing
 from .audio_server import start_audio_server
 from .mcp_tools import register_tools
 from .stackchan_client import StackchanClient
@@ -80,6 +82,7 @@ if __name__ == "__main__":
     mcp = create_mcp(config, http_mode=http_mode, host=mcp_host, port=mcp_port)
     if config.transport == "direct":
         start_audio_server(config.audio_serve_port)
+    threading.Thread(target=audio_processing.warmup_local_models, daemon=True).start()
     if http_mode:
         try:
             ensure_http_auth_configured(config)

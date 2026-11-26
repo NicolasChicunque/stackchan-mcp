@@ -1,14 +1,50 @@
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
 import shutil
 import struct
 import subprocess
+import threading
 import time
 import uuid
 import wave
 from pathlib import Path
 
+import numpy as np
 import requests
+
+try:
+    import edge_tts as _edge_tts_mod
+except ImportError:
+    _edge_tts_mod = None
+
+try:
+    from piper import PiperVoice as _PiperVoice, SynthesisConfig as _PiperSynthesisConfig
+except ImportError:
+    _PiperVoice = None
+    _PiperSynthesisConfig = None
+
+try:
+    from faster_whisper import WhisperModel as _WhisperModel
+except ImportError:
+    _WhisperModel = None
+
+_PIPER_LOCK = threading.Lock()
+_PIPER_CACHE: dict[str, object] = {}
+_WHISPER_LOCK = threading.Lock()
+_WHISPER_MODEL = None
+_WHISPER_MODEL_NAME = None
+
+_DEFAULT_PIPER_ES = Path(__file__).resolve().parents[1] / "models" / "piper" / "es_MX-claude-high.onnx"
+_HALLUCINATIONS = {
+    "gracias por ver",
+    "gracias por ver el video",
+    "gracias por ver el vídeo",
+    "suscríbete",
+    "subtítulos por la comunidad de amara.org",
+    "subtítulos realizados por la comunidad de amara.org",
+}
 
 from .audio_server import AUDIO_DIR, TEMP_AUDIO_DIR
 from .elevenlabs_tts import TtsSynthesisError, collect_pcm, synthesize_pcm
@@ -84,35 +120,72 @@ def publish_validated_wav(temp_wav_path: Path, final_stem: str) -> Path:
 
 
 def require_executable(name: str) -> str:
-    executable = shutil.which(name)
+    fallback = (
+        Path(os.path.expanduser("~"))
+        / "AppData"
+        / "Local"
+        / "Microsoft"
+        / "WinGet"
+        / "Packages"
+        / "Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe"
+        / "ffmpeg-9.0.2-full_build"
+        / "bin"
+        / "ffmpeg.exe"
+    )
+    executable = shutil.which(name) or (str(fallback) if name == "ffmpeg" and fallback.exists() else None)
     if not executable:
         raise RuntimeError(f"Required executable not found on PATH: {name}")
     return executable
 
 
 def tts_edge(text: str, lang: str, config: StackchanConfig) -> Path:
+    with open(AUDIO_DIR / "debug.txt", "a", encoding="utf-8") as _df:
+        _df.write(f"{time.strftime('%X')} [tts_edge] called text={text!r} lang={lang!r}\n")
     voice = EDGE_VOICES.get(lang, EDGE_VOICES["zh"])
     stem = new_tts_stem()
     mp3_path = TEMP_AUDIO_DIR / f"{stem}.mp3"
     temp_wav_path = TEMP_AUDIO_DIR / f"{stem}.wav"
     ffmpeg_bin = require_executable("ffmpeg")
+    rate = getattr(config, "edge_tts_rate", "+10%")
+    pitch = getattr(config, "edge_tts_pitch", "+15Hz")
     try:
-        subprocess.run(  # noqa: S603 - shell=False and executable/args are controlled.
-            [
-                config.edge_tts_bin,
-                "--voice",
-                voice,
-                "--text",
-                text,
-                "--write-media",
-                str(mp3_path),
-            ],
-            check=True,
-            capture_output=True,
-        )
-        subprocess.run(  # noqa: S603 - shell=False and executable/args are controlled.
+        if _edge_tts_mod is not None:
+            async def _synth():
+                comm = _edge_tts_mod.Communicate(text, voice=voice, rate=rate, pitch=pitch)
+                await comm.save(str(mp3_path))
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                asyncio.run(_synth())
+            else:
+                with ThreadPoolExecutor(max_workers=1) as _pool:
+                    _pool.submit(asyncio.run, _synth()).result()
+        else:
+            subprocess.run(
+                [
+                    config.edge_tts_bin,
+                    "--voice",
+                    voice,
+                    "--rate",
+                    rate,
+                    "--pitch",
+                    pitch,
+                    "--text",
+                    text,
+                    "--write-media",
+                    str(mp3_path),
+                ],
+                stdin=subprocess.DEVNULL,
+                check=True,
+                capture_output=True,
+            )
+        with open(AUDIO_DIR / "debug.txt", "a", encoding="utf-8") as _df:
+            _df.write(f"{time.strftime('%X')} [tts_edge] mp3 ready, running ffmpeg\n")
+        subprocess.run(
             [
                 ffmpeg_bin,
+                "-loglevel",
+                "error",
                 "-y",
                 "-i",
                 str(mp3_path),
@@ -124,10 +197,24 @@ def tts_edge(text: str, lang: str, config: StackchanConfig) -> Path:
                 "s16",
                 str(temp_wav_path),
             ],
+            stdin=subprocess.DEVNULL,
             check=True,
             capture_output=True,
         )
+        with open(AUDIO_DIR / "debug.txt", "a", encoding="utf-8") as _df:
+            _df.write(f"{time.strftime('%X')} [tts_edge] wav ready\n")
         return publish_validated_wav(temp_wav_path, stem)
+    except subprocess.CalledProcessError as exc:
+        with open(AUDIO_DIR / "debug.txt", "a", encoding="utf-8") as _df:
+            _df.write(
+                f"{time.strftime('%X')} [tts_edge CalledProcessError] rc={exc.returncode} "
+                f"err={exc.stderr.decode('utf-8', errors='ignore') if exc.stderr else ''}\n"
+            )
+        raise
+    except Exception as exc:
+        with open(AUDIO_DIR / "debug.txt", "a", encoding="utf-8") as _df:
+            _df.write(f"{time.strftime('%X')} [tts_edge exc] {type(exc).__name__}: {exc}\n")
+        raise
     finally:
         mp3_path.unlink(missing_ok=True)
         temp_wav_path.unlink(missing_ok=True)
@@ -156,7 +243,7 @@ def tts_fish(text: str, lang: str, config: StackchanConfig) -> Path:
         )
         raise_for_fish_status(resp)
         raw_path.write_bytes(resp.content)
-        subprocess.run(  # noqa: S603 - shell=False and executable/args are controlled.
+        subprocess.run(
             [
                 ffmpeg_bin,
                 "-y",
@@ -172,18 +259,130 @@ def tts_fish(text: str, lang: str, config: StackchanConfig) -> Path:
                 "s16",
                 str(temp_wav_path),
             ],
+            stdin=subprocess.DEVNULL,
             check=True,
             capture_output=True,
         )
         return publish_validated_wav(temp_wav_path, stem)
+    except subprocess.CalledProcessError as exc:
+        with open(AUDIO_DIR / "debug.txt", "a", encoding="utf-8") as _df:
+            _df.write(
+                f"{time.strftime('%X')} [tts_fish CalledProcessError] rc={exc.returncode} "
+                f"err={exc.stderr.decode('utf-8', errors='ignore') if exc.stderr else ''}\n"
+            )
+        raise
+    except Exception as exc:
+        with open(AUDIO_DIR / "debug.txt", "a", encoding="utf-8") as _df:
+            _df.write(f"{time.strftime('%X')} [tts_fish exc] {type(exc).__name__}: {exc}\n")
+        raise
     finally:
         raw_path.unlink(missing_ok=True)
         temp_wav_path.unlink(missing_ok=True)
 
 
+def _get_piper_voice(model_path: Path):
+    key = str(model_path)
+    voice = _PIPER_CACHE.get(key)
+    if voice is not None:
+        return voice
+    with _PIPER_LOCK:
+        voice = _PIPER_CACHE.get(key)
+        if voice is None:
+            voice = _PiperVoice.load(key)
+            # 1-word warmup compiles ONNX execution graph once
+            list(voice.synthesize("ok"))
+            _PIPER_CACHE[key] = voice
+        return voice
+
+
+def tts_piper(text: str, lang: str, config: StackchanConfig) -> Path:
+    t0 = time.perf_counter()
+    model_str = os.environ.get("STACKCHAN_PIPER_MODEL", str(_DEFAULT_PIPER_ES))
+    model_path = Path(model_str)
+    if _PiperVoice is None or not model_path.exists() or not lang.lower().startswith("es"):
+        return tts_edge(text, lang, config)
+
+    voice = _get_piper_voice(model_path)
+    length_scale = float(os.environ.get("STACKCHAN_PIPER_LENGTH_SCALE", "0.90"))
+    syn_cfg = _PiperSynthesisConfig(length_scale=length_scale) if _PiperSynthesisConfig else None
+    pcm_bytes = b"".join(c.audio_int16_bytes for c in voice.synthesize(text, syn_config=syn_cfg))
+    if not pcm_bytes:
+        return tts_edge(text, lang, config)
+
+    src = np.frombuffer(pcm_bytes, dtype=np.int16)
+    src_rate = int(getattr(voice.config, "sample_rate", 22050))
+    if src_rate != PCM_SAMPLE_RATE and len(src) > 1:
+        n_out = int(round(len(src) * PCM_SAMPLE_RATE / src_rate))
+        xp = np.linspace(0.0, float(len(src) - 1), len(src), dtype=np.float32)
+        x_new = np.linspace(0.0, float(len(src) - 1), n_out, dtype=np.float32)
+        dst = np.interp(x_new, xp, src).astype(np.int16)
+    else:
+        dst = src
+
+    stem = new_tts_stem()
+    temp_wav_path = TEMP_AUDIO_DIR / f"{stem}.wav"
+    final_path = AUDIO_DIR / f"{stem}.wav"
+    try:
+        with wave.open(str(temp_wav_path), "wb") as wav:
+            wav.setnchannels(PCM_CHANNELS)
+            wav.setsampwidth(PCM_SAMPLE_WIDTH)
+            wav.setframerate(PCM_SAMPLE_RATE)
+            wav.writeframes(dst.tobytes())
+        os.replace(temp_wav_path, final_path)
+    finally:
+        temp_wav_path.unlink(missing_ok=True)
+
+    with open(AUDIO_DIR / "debug.txt", "a", encoding="utf-8") as _df:
+        _df.write(f"{time.strftime('%X')} [tts_piper] {time.perf_counter() - t0:.3f}s text={text!r}\n")
+    return final_path
+
+
+def _get_whisper_model():
+    global _WHISPER_MODEL, _WHISPER_MODEL_NAME
+    size = os.environ.get("STACKCHAN_WHISPER_MODEL", "base").strip() or "base"
+    if _WHISPER_MODEL is not None and _WHISPER_MODEL_NAME == size:
+        return _WHISPER_MODEL
+    with _WHISPER_LOCK:
+        if _WHISPER_MODEL is None or _WHISPER_MODEL_NAME != size:
+            threads = int(os.environ.get("STACKCHAN_WHISPER_THREADS", "8"))
+            model = _WhisperModel(size, device="cpu", compute_type="int8", cpu_threads=threads)
+            # Short warmup so first real turn has zero graph compile lag
+            list(
+                model.transcribe(
+                    np.zeros(8000, dtype=np.float32),
+                    language="es",
+                    beam_size=1,
+                    without_timestamps=True,
+                    condition_on_previous_text=False,
+                )[0]
+            )
+            _WHISPER_MODEL = model
+            _WHISPER_MODEL_NAME = size
+        return _WHISPER_MODEL
+
+
+def warmup_local_models() -> None:
+    """Preload Piper TTS and Faster-Whisper into RAM in the background at server boot."""
+    try:
+        model_path = Path(os.environ.get("STACKCHAN_PIPER_MODEL", str(_DEFAULT_PIPER_ES)))
+        if _PiperVoice is not None and model_path.exists():
+            _get_piper_voice(model_path)
+    except Exception as exc:
+        logger.warning("Piper warmup failed: %s", exc)
+    try:
+        if _WhisperModel is not None and os.environ.get("STACKCHAN_ASR_ENGINE", "whisper").lower() != "google":
+            _get_whisper_model()
+    except Exception as exc:
+        logger.warning("Whisper warmup failed: %s", exc)
+
+
 def generate_tts(
     text: str, lang: str, config: StackchanConfig, *, details: dict[str, str] | None = None
 ) -> Path:
+    if config.tts_engine == "piper":
+        if details is not None:
+            details["engine"] = "piper"
+        return tts_piper(text, lang, config)
     if config.tts_engine == "elevenlabs":
         pcm, engine = prepare_elevenlabs_pcm(text, lang, config)
         if details is not None:
@@ -212,7 +411,6 @@ def prepare_elevenlabs_pcm(text: str, lang: str, config: StackchanConfig) -> tup
             raise TtsSynthesisError(f"{exc}; Fish fallback is not configured") from None
         logger.warning("ElevenLabs unavailable; synthesizing once with Fish: %s", exc)
 
-    # Never expose a partial provider response to the body before switching voices.
     chunks = iter_fish_pcm_stream(text, lang, config)
     try:
         pcm = collect_pcm(
@@ -335,6 +533,70 @@ def iter_fish_pcm_stream(text: str, lang: str, config: StackchanConfig):
 
 
 def transcribe_audio(wav_path: Path, lang: str, config: StackchanConfig) -> dict:
+    if not config.fish_audio_key or config.fish_audio_key.startswith("replace-"):
+        asr_engine = os.environ.get("STACKCHAN_ASR_ENGINE", "whisper").strip().lower()
+        if asr_engine != "google" and _WhisperModel is not None:
+            try:
+                t0 = time.perf_counter()
+                with wave.open(str(wav_path), "rb") as w:
+                    sr_hz = w.getframerate()
+                    n_frames = w.getnframes()
+                    pcm = np.frombuffer(w.readframes(n_frames), dtype=np.int16)
+                duration = n_frames / float(sr_hz) if sr_hz else 0.0
+                if len(pcm) < 1600:
+                    return {"text": "", "language": lang, "duration": duration}
+                rms = float(np.sqrt(np.mean(pcm.astype(np.float32) ** 2)))
+                if rms < 110.0:
+                    return {"text": "", "language": lang, "duration": duration}
+                audio_f32 = pcm.astype(np.float32) / 32768.0
+                if sr_hz and sr_hz != 16000:
+                    n_out = int(round(len(audio_f32) * 16000 / sr_hz))
+                    xp = np.linspace(0.0, float(len(audio_f32) - 1), len(audio_f32), dtype=np.float32)
+                    x_new = np.linspace(0.0, float(len(audio_f32) - 1), n_out, dtype=np.float32)
+                    audio_f32 = np.interp(x_new, xp, audio_f32).astype(np.float32)
+                model = _get_whisper_model()
+                whisper_lang = lang.split("-")[0].lower() if lang else "es"
+                segs, _ = model.transcribe(
+                    audio_f32,
+                    language=whisper_lang,
+                    beam_size=1,
+                    vad_filter=True,
+                    vad_parameters={"min_silence_duration_ms": 250},
+                    without_timestamps=True,
+                    condition_on_previous_text=False,
+                    initial_prompt="Hola Nicolás, StackChan, Antigravity, MCP, firmware.",
+                )
+                text = " ".join(s.text.strip() for s in segs).strip()
+                norm = text.lower().strip(" .!?,¡¿")
+                if norm in _HALLUCINATIONS:
+                    text = ""
+                with open(AUDIO_DIR / "debug.txt", "a", encoding="utf-8") as _df:
+                    _df.write(
+                        f"{time.strftime('%X')} [asr_whisper] {time.perf_counter() - t0:.3f}s "
+                        f"dur={duration:.1f}s text={text!r}\n"
+                    )
+                return {"text": text, "language": whisper_lang, "duration": duration}
+            except Exception as exc:
+                logger.warning("Local Whisper failed, falling back to Google STT: %s", exc)
+        try:
+            import speech_recognition as sr
+
+            r = sr.Recognizer()
+            with sr.AudioFile(str(wav_path)) as source:
+                audio = r.record(source)
+            stt_lang = "es-ES" if lang.startswith("es") else ("zh-CN" if lang == "zh" else "en-US")
+            text = r.recognize_google(audio, language=stt_lang)
+            duration = 0.0
+            try:
+                with wave.open(str(wav_path), "rb") as w:
+                    duration = w.getnframes() / float(w.getframerate())
+            except Exception:
+                pass
+            return {"text": text, "language": stt_lang, "duration": duration}
+        except Exception as exc:
+            logger.warning("Speech recognition failed: %s", exc)
+            return {"text": "", "error": str(exc)}
+
     with open(wav_path, "rb") as f:
         resp = requests.post(
             "https://api.fish.audio/v1/asr",
