@@ -397,6 +397,13 @@ def parse_args() -> argparse.Namespace:
         help="Seconds to wait for speech before prompting (0 = silent indefinite standby)",
     )
     parser.add_argument("--no-greeting", action="store_true", help="Skip the initial spoken greeting")
+    parser.add_argument(
+        "--wait-reply",
+        action="store_true",
+        help="Single-turn engineer follow-up mode: optionally speak --say, then wait indefinitely for one reply and exit",
+    )
+    parser.add_argument("--say", default="", help="Text to speak before listening in --wait-reply mode")
+    parser.add_argument("--face", default="happy", help="Face expression when speaking in --wait-reply mode")
     parser.add_argument("--verbose", action="store_true", help="Also stream full per-turn transcript to stdout")
     return parser.parse_args()
 
@@ -404,6 +411,40 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     config = load_config()
+
+    device_client = StackchanClient(config)
+    start_audio_server(config.audio_serve_port)
+    print("[stackchan_chat] Warming up local models...", flush=True)
+    # Warmup runs in a background thread so the greeting can be synthesized in parallel.
+    warmup_thread = threading.Thread(target=audio_processing.warmup_local_models, daemon=True)
+    warmup_thread.start()
+    with suppress(Exception):
+        if device_client.audio_status().get("ready"):
+            device_client.get_audio()
+            device_client.resume_listen()
+
+    cleanup_stale_temp_files()
+    raw_lang = args.lang.strip().lower()
+    active_lang = detect_os_language() if raw_lang in ("", "auto", "os") else raw_lang.split("-")[0]
+
+    if args.wait_reply:
+        heard, _detected_lang = speak_and_listen(
+            device_client,
+            config,
+            args.say.strip(),
+            tts_lang=active_lang,
+            asr_lang=active_lang,
+            listen_timeout=args.listen_timeout,
+            face=args.face,
+            gesture="",
+        )
+        with suppress(Exception):
+            device_client.set_face("thinking")
+        if heard:
+            print(f"\n[USER_REPLY ({active_lang})] {heard}", flush=True)
+        else:
+            print(f"\n[USER_REPLY_TIMEOUT ({active_lang})]", flush=True)
+        sys.exit(0)
 
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
@@ -417,18 +458,7 @@ def main() -> None:
             "retry_options": {"attempts": 1},
         },
     )
-    device_client = StackchanClient(config)
-    start_audio_server(config.audio_serve_port)
-    print("[stackchan_chat] Warming up local models...", flush=True)
-    # Warmup runs in a background thread so the greeting can be synthesized in parallel.
-    warmup_thread = threading.Thread(target=audio_processing.warmup_local_models, daemon=True)
-    warmup_thread.start()
-    with suppress(Exception):
-        if device_client.audio_status().get("ready"):
-            device_client.get_audio()
-            device_client.resume_listen()
 
-    cleanup_stale_temp_files()
     log_path = AUDIO_DIR / "chat_latest.log"
     with log_path.open("w", encoding="utf-8", buffering=1) as log_file:
         def log_line(msg: str) -> None:
@@ -437,8 +467,6 @@ def main() -> None:
             if args.verbose:
                 print(msg, flush=True)
 
-        raw_lang = args.lang.strip().lower()
-        active_lang = detect_os_language() if raw_lang in ("", "auto", "os") else raw_lang.split("-")[0]
         next_say = "" if args.no_greeting else localized_text(active_lang, "greeting")
         previous_interaction_id: str | None = None
         history_model: str | None = None
