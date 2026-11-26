@@ -428,6 +428,7 @@ def main() -> None:
     active_lang = detect_os_language() if raw_lang in ("", "auto", "os") else raw_lang.split("-")[0]
 
     if args.wait_reply:
+        device_client.set_agent_mode("engineer")
         heard, _detected_lang = speak_and_listen(
             device_client,
             config,
@@ -477,6 +478,7 @@ def main() -> None:
         start_msg = f"[stackchan_chat] Started (model={args.model}, lang={active_lang}, requested={args.lang}, log={log_path})"
         log_file.write(f"{time.strftime('%H:%M:%S')} {start_msg}\n")
         print(start_msg, flush=True)
+        device_client.set_agent_mode("free")
 
         while args.turns <= 0 or completed_turns < args.turns:
             if next_say:
@@ -505,6 +507,7 @@ def main() -> None:
             lowered = heard.lower()
 
             if any(phrase in lowered for phrase in _USER_ESCALATE_PHRASES):
+                device_client.set_agent_mode("engineer")
                 speak_only(
                     device_client,
                     config,
@@ -518,6 +521,7 @@ def main() -> None:
                 sys.exit(0)
 
             if any(phrase == lowered.strip(" .!?,¡¿") for phrase in _USER_END_PHRASES):
+                device_client.set_agent_mode("idle")
                 speak_only(device_client, config, localized_text(active_lang, "goodbye"), active_lang, face="calm")
                 log_line("[stackchan_chat] Session ended by user.")
                 print(f"[stackchan_chat] Session ended by user ({completed_turns} turns). Log: {log_path}", flush=True)
@@ -552,6 +556,7 @@ def main() -> None:
 
             escalate_match = _ESCALATE_RE.search(reply)
             if escalate_match:
+                device_client.set_agent_mode("engineer")
                 task = escalate_match.group(1).strip()
                 # Only speak a prefix if it comes BEFORE the escalate marker and contains no escalation text.
                 raw_prefix = reply[: escalate_match.start()].strip()
@@ -566,6 +571,7 @@ def main() -> None:
                 sys.exit(0)
 
             if _END_RE.search(reply):
+                device_client.set_agent_mode("idle")
                 speak_only(device_client, config, localized_text(active_lang, "goodbye"), active_lang, face="calm")
                 log_line("[stackchan_chat] Session ended by user.")
                 print(f"[stackchan_chat] Session ended by user ({completed_turns} turns). Log: {log_path}", flush=True)

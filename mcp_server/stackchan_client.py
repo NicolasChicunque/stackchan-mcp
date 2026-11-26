@@ -287,6 +287,16 @@ class StackchanClient:
                 timeout=1.5,
             )
 
+    def set_agent_mode(self, mode: str) -> None:
+        """Update the operating mode badge on StackChan's MCP screen ('free', 'engineer', or 'idle')."""
+        with suppress(Exception):
+            self.request(
+                "post",
+                f"{self.base_url}/agent_mode",
+                json_body={"mode": mode},
+                timeout=1.5,
+            )
+
     def get_booth_mode(self) -> dict:
         """Read booth status without changing capture or consuming recorded audio."""
         return self._booth_mode_request("get")
