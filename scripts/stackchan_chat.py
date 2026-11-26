@@ -488,7 +488,8 @@ def main() -> None:
             with suppress(Exception):
                 if device_client.playback_status().get("playing"):
                     wait_for_playback_end(device_client, timeout_sec=20.0)
-        device_client.set_agent_mode("free")
+        model_short = "3.5 LITE" if "3.5" in args.model else ("3.1 LITE" if "3.1" in args.model else "INTERACT")
+        device_client.set_agent_mode("free", label=f"FREE {model_short}")
 
         while args.turns <= 0 or completed_turns < args.turns:
             if next_say:

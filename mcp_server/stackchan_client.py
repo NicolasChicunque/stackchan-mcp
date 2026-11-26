@@ -287,13 +287,16 @@ class StackchanClient:
                 timeout=1.5,
             )
 
-    def set_agent_mode(self, mode: str) -> None:
+    def set_agent_mode(self, mode: str, label: str = "") -> None:
         """Update the operating mode badge on StackChan's MCP screen ('free', 'engineer', or 'idle')."""
+        body: dict[str, str] = {"mode": mode}
+        if label:
+            body["label"] = label
         with suppress(Exception):
             self.request(
                 "post",
                 f"{self.base_url}/agent_mode",
-                json_body={"mode": mode},
+                json_body=body,
                 timeout=1.5,
             )
 
