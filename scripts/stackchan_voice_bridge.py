@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -8,7 +7,17 @@ import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, TextIO
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows lacks fcntl; stub keeps module & test monkeypatches working
+
+    def _unsupported_flock(_fd: int, _op: int) -> None:
+        raise NotImplementedError("fcntl.flock is not available on Windows")
+
+    fcntl: Any = SimpleNamespace(LOCK_EX=2, LOCK_NB=4, flock=_unsupported_flock)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:

@@ -185,6 +185,14 @@ EDGE_VOICES = {
     "es-CO": "es-CO-SalomeNeural",
     "es-MX": "es-MX-DaliaNeural",
     "es-ES": "es-ES-ElviraNeural",
+    "fr": "fr-FR-HenriNeural",
+    "pt": "pt-BR-AntonioNeural",
+    "de": "de-DE-ConradNeural",
+    "it": "it-IT-DiegoNeural",
+    "ja": "ja-JP-KeitaNeural",
+    "ko": "ko-KR-InJoonNeural",
+    "el": "el-GR-NestorasNeural",
+    "ru": "ru-RU-DmitryNeural",
 }
 
 

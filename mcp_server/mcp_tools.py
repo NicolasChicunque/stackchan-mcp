@@ -4,6 +4,8 @@ import os
 import shutil
 import threading
 import time
+from contextlib import suppress
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -376,13 +378,11 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                 )
                 wav_timing["publish"] = timing_ms(t0)
             baseline_started_ms = None
-            baseline_playing = False
             try:
                 t0 = time.perf_counter()
                 baseline_status = client.playback_status()
                 wav_timing["status"] = timing_ms(t0)
                 baseline_started_ms = baseline_status.get("started_ms")
-                baseline_playing = bool(baseline_status.get("playing"))
             except Exception as exc:
                 logger.warning("Could not read playback status before /play: %s", exc)
 
@@ -498,23 +498,19 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                 wav_path = audio_processing.generate_tts(text.strip(), lang, config)
                 url = audio_url(config.mac_ip, config.audio_serve_port, wav_path.name)
                 if face and face in VALID_FACES:
-                    try:
+                    with suppress(Exception):
                         client.set_face(face)
-                    except Exception:
-                        pass
                 res = client.play(url)
                 if not res.get("success"):
                     return f"❌ Play failed: {res}"
                 if gesture in {"nod", "shake", "home"}:
-                    try:
+                    with suppress(Exception):
                         client.gesture(gesture)
-                    except Exception:
-                        pass
 
                 play_deadline = time.monotonic() + 30.0
                 saw_playing = False
                 while time.monotonic() < play_deadline:
-                    try:
+                    with suppress(Exception):
                         pst = client.playback_status()
                         if pst.get("playing"):
                             saw_playing = True
@@ -523,15 +519,13 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                             break
                         elif time.monotonic() > play_deadline - 25.0:
                             break
-                    except Exception:
-                        pass
                     time.sleep(0.04)
 
             if not (text and text.strip()):
                 client.resume_listen()
             listen_deadline = time.monotonic() + wait_limit
             while time.monotonic() < listen_deadline:
-                try:
+                with suppress(Exception):
                     ast = client.audio_status()
                     if ast.get("ready"):
                         audio_data = client.get_audio()
@@ -544,8 +538,6 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                                 dur = float(asr.get("duration") or 0.0)
                                 return f'Heard ({dur:.1f}s): "{heard}"'
                         client.resume_listen()
-                except Exception:
-                    pass
                 time.sleep(0.035)
 
             return f"Timeout ({wait_limit}s)"

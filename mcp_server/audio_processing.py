@@ -1,5 +1,4 @@
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
 import shutil
@@ -9,7 +8,10 @@ import threading
 import time
 import uuid
 import wave
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import requests
@@ -20,7 +22,8 @@ except ImportError:
     _edge_tts_mod = None
 
 try:
-    from piper import PiperVoice as _PiperVoice, SynthesisConfig as _PiperSynthesisConfig
+    from piper import PiperVoice as _PiperVoice
+    from piper import SynthesisConfig as _PiperSynthesisConfig
 except ImportError:
     _PiperVoice = None
     _PiperSynthesisConfig = None
@@ -29,22 +32,6 @@ try:
     from faster_whisper import WhisperModel as _WhisperModel
 except ImportError:
     _WhisperModel = None
-
-_PIPER_LOCK = threading.Lock()
-_PIPER_CACHE: dict[str, object] = {}
-_WHISPER_LOCK = threading.Lock()
-_WHISPER_MODEL = None
-_WHISPER_MODEL_NAME = None
-
-_DEFAULT_PIPER_ES = Path(__file__).resolve().parents[1] / "models" / "piper" / "es_MX-claude-high.onnx"
-_HALLUCINATIONS = {
-    "gracias por ver",
-    "gracias por ver el video",
-    "gracias por ver el vídeo",
-    "suscríbete",
-    "subtítulos por la comunidad de amara.org",
-    "subtítulos realizados por la comunidad de amara.org",
-}
 
 from .audio_server import AUDIO_DIR, TEMP_AUDIO_DIR
 from .elevenlabs_tts import TtsSynthesisError, collect_pcm, synthesize_pcm
@@ -56,6 +43,23 @@ from .stackchan_config import (
     PCM_SAMPLE_WIDTH,
     StackchanConfig,
 )
+
+_PIPER_LOCK = threading.Lock()
+_PIPER_CACHE: dict[str, Any] = {}
+_WHISPER_LOCK = threading.Lock()
+_WHISPER_MODEL: Any = None
+_WHISPER_MODEL_NAME: str | None = None
+
+_DEFAULT_PIPER_ES = Path(__file__).resolve().parents[1] / "models" / "piper" / "es_MX-claude-high.onnx"
+_AUTO_PRIMARY_LANGS = {"es", "en", "fr", "pt", "de", "it", "zh", "ja", "ko"}
+_HALLUCINATIONS = {
+    "gracias por ver",
+    "gracias por ver el video",
+    "gracias por ver el vídeo",
+    "suscríbete",
+    "subtítulos por la comunidad de amara.org",
+    "subtítulos realizados por la comunidad de amara.org",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +145,9 @@ def require_executable(name: str) -> str:
 def tts_edge(text: str, lang: str, config: StackchanConfig) -> Path:
     with open(AUDIO_DIR / "debug.txt", "a", encoding="utf-8") as _df:
         _df.write(f"{time.strftime('%X')} [tts_edge] called text={text!r} lang={lang!r}\n")
-    voice = EDGE_VOICES.get(lang, EDGE_VOICES["zh"])
+    norm_lang = (lang or "en").strip()
+    base_lang = norm_lang.split("-")[0].lower()
+    voice = EDGE_VOICES.get(norm_lang) or EDGE_VOICES.get(base_lang) or EDGE_VOICES["en"]
     stem = new_tts_stem()
     mp3_path = TEMP_AUDIO_DIR / f"{stem}.mp3"
     temp_wav_path = TEMP_AUDIO_DIR / f"{stem}.wav"
@@ -150,8 +156,10 @@ def tts_edge(text: str, lang: str, config: StackchanConfig) -> Path:
     pitch = getattr(config, "edge_tts_pitch", "+15Hz")
     try:
         if _edge_tts_mod is not None:
+            edge_tts_mod = _edge_tts_mod
+
             async def _synth():
-                comm = _edge_tts_mod.Communicate(text, voice=voice, rate=rate, pitch=pitch)
+                comm = edge_tts_mod.Communicate(text, voice=voice, rate=rate, pitch=pitch)
                 await comm.save(str(mp3_path))
             try:
                 asyncio.get_running_loop()
@@ -161,7 +169,7 @@ def tts_edge(text: str, lang: str, config: StackchanConfig) -> Path:
                 with ThreadPoolExecutor(max_workers=1) as _pool:
                     _pool.submit(asyncio.run, _synth()).result()
         else:
-            subprocess.run(
+            subprocess.run(  # noqa: S603 - shell=False and executable/args are controlled.
                 [
                     config.edge_tts_bin,
                     "--voice",
@@ -181,7 +189,7 @@ def tts_edge(text: str, lang: str, config: StackchanConfig) -> Path:
             )
         with open(AUDIO_DIR / "debug.txt", "a", encoding="utf-8") as _df:
             _df.write(f"{time.strftime('%X')} [tts_edge] mp3 ready, running ffmpeg\n")
-        subprocess.run(
+        subprocess.run(  # noqa: S603 - shell=False and executable/args are controlled.
             [
                 ffmpeg_bin,
                 "-loglevel",
@@ -243,7 +251,7 @@ def tts_fish(text: str, lang: str, config: StackchanConfig) -> Path:
         )
         raise_for_fish_status(resp)
         raw_path.write_bytes(resp.content)
-        subprocess.run(
+        subprocess.run(  # noqa: S603 - shell=False and executable/args are controlled.
             [
                 ffmpeg_bin,
                 "-y",
@@ -280,7 +288,7 @@ def tts_fish(text: str, lang: str, config: StackchanConfig) -> Path:
         temp_wav_path.unlink(missing_ok=True)
 
 
-def _get_piper_voice(model_path: Path):
+def _get_piper_voice(model_path: Path) -> Any:
     key = str(model_path)
     voice = _PIPER_CACHE.get(key)
     if voice is not None:
@@ -288,6 +296,8 @@ def _get_piper_voice(model_path: Path):
     with _PIPER_LOCK:
         voice = _PIPER_CACHE.get(key)
         if voice is None:
+            if _PiperVoice is None:
+                raise RuntimeError("piper-tts is not installed")
             voice = _PiperVoice.load(key)
             # 1-word warmup compiles ONNX execution graph once
             list(voice.synthesize("ok"))
@@ -340,18 +350,21 @@ def tts_piper(text: str, lang: str, config: StackchanConfig) -> Path:
 def _get_whisper_model():
     global _WHISPER_MODEL, _WHISPER_MODEL_NAME
     size = os.environ.get("STACKCHAN_WHISPER_MODEL", "base").strip() or "base"
-    if _WHISPER_MODEL is not None and _WHISPER_MODEL_NAME == size:
+    if _WHISPER_MODEL is not None and size == _WHISPER_MODEL_NAME:
         return _WHISPER_MODEL
     with _WHISPER_LOCK:
-        if _WHISPER_MODEL is None or _WHISPER_MODEL_NAME != size:
+        if _WHISPER_MODEL is None or size != _WHISPER_MODEL_NAME:
+            if _WhisperModel is None:
+                raise RuntimeError("faster-whisper is not installed")
             threads = int(os.environ.get("STACKCHAN_WHISPER_THREADS", "8"))
             model = _WhisperModel(size, device="cpu", compute_type="int8", cpu_threads=threads)
-            # Short warmup so first real turn has zero graph compile lag
+            # Short warmup so first real turn (including auto language detect) has zero graph compile lag
             list(
                 model.transcribe(
                     np.zeros(8000, dtype=np.float32),
-                    language="es",
+                    language=None,
                     beam_size=1,
+                    temperature=0.0,
                     without_timestamps=True,
                     condition_on_previous_text=False,
                 )[0]
@@ -555,27 +568,66 @@ def transcribe_audio(wav_path: Path, lang: str, config: StackchanConfig) -> dict
                     x_new = np.linspace(0.0, float(len(audio_f32) - 1), n_out, dtype=np.float32)
                     audio_f32 = np.interp(x_new, xp, audio_f32).astype(np.float32)
                 model = _get_whisper_model()
-                whisper_lang = lang.split("-")[0].lower() if lang else "es"
-                segs, _ = model.transcribe(
-                    audio_f32,
-                    language=whisper_lang,
-                    beam_size=1,
-                    vad_filter=True,
-                    vad_parameters={"min_silence_duration_ms": 250},
-                    without_timestamps=True,
-                    condition_on_previous_text=False,
-                    initial_prompt="Hola Nicolás, StackChan, Antigravity, MCP, firmware.",
-                )
-                text = " ".join(s.text.strip() for s in segs).strip()
+                normalized_lang = (lang or "").strip().lower()
+                whisper_lang = None if normalized_lang in ("", "auto") else normalized_lang.split("-")[0]
+
+                def _run_whisper(target_lang: str | None):
+                    prompt = (
+                        "Hola Nicolás, StackChan, Antigravity, MCP, firmware."
+                        if target_lang == "es"
+                        else "StackChan, Antigravity, MCP, firmware."
+                    )
+                    segs_iter, tr_info = model.transcribe(
+                        audio_f32,
+                        language=target_lang,
+                        beam_size=1,
+                        temperature=0.0,
+                        vad_filter=True,
+                        vad_parameters={"min_silence_duration_ms": 250},
+                        without_timestamps=True,
+                        condition_on_previous_text=False,
+                        initial_prompt=prompt,
+                    )
+                    dur_vad = getattr(tr_info, "duration_after_vad", None)
+                    if dur_vad is not None and dur_vad < 0.18:
+                        return [], tr_info
+                    return list(segs_iter), tr_info
+
+                segs_list, info = _run_whisper(whisper_lang)
+                detected_lang = whisper_lang or (getattr(info, "language", None) or "es")
+                lang_prob = float(getattr(info, "language_probability", 1.0) or 0.0)
+
+                if whisper_lang is None and segs_list and detected_lang not in _AUTO_PRIMARY_LANGS and lang_prob < 0.85:
+                    all_probs = getattr(info, "all_language_probs", None) or []
+                    fallback_lang = next(
+                        (code for code, _prob in all_probs if code in _AUTO_PRIMARY_LANGS),
+                        "es",
+                    )
+                    segs_list, info = _run_whisper(fallback_lang)
+                    detected_lang = fallback_lang
+                    lang_prob = float(getattr(info, "language_probability", 1.0) or 0.0)
+
+                valid_segs = [
+                    s
+                    for s in segs_list
+                    if getattr(s, "no_speech_prob", 0.0) <= 0.75
+                    and getattr(s, "avg_logprob", 0.0) >= -1.25
+                ]
+                if whisper_lang is None and lang_prob < 0.35 and all(
+                    getattr(s, "avg_logprob", 0.0) < -0.9 for s in valid_segs
+                ):
+                    valid_segs = []
+
+                text = " ".join(s.text.strip() for s in valid_segs).strip()
                 norm = text.lower().strip(" .!?,¡¿")
                 if norm in _HALLUCINATIONS:
                     text = ""
                 with open(AUDIO_DIR / "debug.txt", "a", encoding="utf-8") as _df:
                     _df.write(
                         f"{time.strftime('%X')} [asr_whisper] {time.perf_counter() - t0:.3f}s "
-                        f"dur={duration:.1f}s text={text!r}\n"
+                        f"lang={detected_lang} prob={lang_prob:.2f} dur={duration:.1f}s text={text!r}\n"
                     )
-                return {"text": text, "language": whisper_lang, "duration": duration}
+                return {"text": text, "language": detected_lang, "duration": duration}
             except Exception as exc:
                 logger.warning("Local Whisper failed, falling back to Google STT: %s", exc)
         try:
@@ -585,13 +637,10 @@ def transcribe_audio(wav_path: Path, lang: str, config: StackchanConfig) -> dict
             with sr.AudioFile(str(wav_path)) as source:
                 audio = r.record(source)
             stt_lang = "es-ES" if lang.startswith("es") else ("zh-CN" if lang == "zh" else "en-US")
-            text = r.recognize_google(audio, language=stt_lang)
+            text = r.recognize_google(audio, language=stt_lang)  # type: ignore[attr-defined]
             duration = 0.0
-            try:
-                with wave.open(str(wav_path), "rb") as w:
-                    duration = w.getnframes() / float(w.getframerate())
-            except Exception:
-                pass
+            with suppress(Exception), wave.open(str(wav_path), "rb") as w:
+                duration = w.getnframes() / float(w.getframerate())
             return {"text": text, "language": stt_lang, "duration": duration}
         except Exception as exc:
             logger.warning("Speech recognition failed: %s", exc)

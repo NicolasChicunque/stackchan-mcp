@@ -194,6 +194,7 @@ def test_server_entrypoint_registers_expected_tools(monkeypatch):
     assert set(mcp.tools) == {
         "stackchan_say",
         "stackchan_listen",
+        "stackchan_converse",
         "stackchan_move",
         "stackchan_nod",
         "stackchan_shake",

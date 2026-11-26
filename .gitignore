@@ -49,6 +49,7 @@ CLAUDE.md
 *.pid
 *.tmp
 *.bak
+models/
 stackchan_audio/
 .stackchan_audio/
 stackchan_otel.jsonl
