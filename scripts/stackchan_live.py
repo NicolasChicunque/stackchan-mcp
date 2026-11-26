@@ -359,10 +359,12 @@ async def run_live_loop(args: argparse.Namespace, active_lang: str) -> int:
     turn = 0
     while turn < args.max_turns:
         live_cfg = build_live_config(active_voice, lang=active_lang, context=args.context if first_connect else "")
+        will_greet = (not args.no_greeting) or (not first_connect)
 
-        with suppress(Exception):
-            device.set_agent_mode("live", label=f"LIVE {active_voice}")
-            device.set_face("calm")
+        if not will_greet:
+            with suppress(Exception):
+                device.set_agent_mode("live", label=f"LIVE {active_voice}")
+                device.set_face("calm")
 
         print(
             f"[stackchan_live] Connecting to {args.model} (voice={active_voice}, lang={active_lang}, port={live_port})...",
@@ -373,7 +375,7 @@ async def run_live_loop(args: argparse.Namespace, active_lang: str) -> int:
         async with genai_client.aio.live.connect(model=args.model, config=live_cfg) as session:
             print(f"[stackchan_live] Connected! LIVE 3.8 ({active_voice}) streaming session active.", flush=True)
 
-            if not args.no_greeting or not first_connect:
+            if will_greet:
                 if first_connect:
                     greet_prompt = (
                         f"Saluda en una frase muy corta en español diciendo que ya estás listo en modo Gemini Live con la voz {active_voice}."
@@ -394,6 +396,9 @@ async def run_live_loop(args: argparse.Namespace, active_lang: str) -> int:
                 _heard, spoken, _esc, _tcid, _end, ttfa = await asyncio.wait_for(
                     receive_and_stream_turn(session, device, config, live_port, t0), timeout=25.0
                 )
+                with suppress(Exception):
+                    device.set_agent_mode("live", label=f"LIVE {active_voice}")
+                    device.set_face("calm")
                 if spoken:
                     ttfa_s = f"{ttfa:.2f}s" if ttfa is not None else "n/a"
                     print(f"[Greeting (TTFA={ttfa_s})] {spoken}", flush=True)
