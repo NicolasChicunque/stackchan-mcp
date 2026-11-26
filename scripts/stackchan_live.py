@@ -199,7 +199,12 @@ def listen_for_wav(
     return b"", expected_voice
 
 
-def build_live_config(voice: str, lang: str = "es", context: str = "") -> types.LiveConnectConfig:
+def build_live_config(
+    voice: str,
+    lang: str = "es",
+    context: str = "",
+    resumption_handle: str | None = None,
+) -> types.LiveConnectConfig:
     instr = LIVE_SYSTEM_INSTRUCTION
     if lang:
         instr += f"\nActive conversation language: {lang}."
@@ -240,11 +245,51 @@ def build_live_config(voice: str, lang: str = "es", context: str = "") -> types.
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
             )
         ),
+        session_resumption=types.SessionResumptionConfig(handle=resumption_handle),
         input_audio_transcription=types.AudioTranscriptionConfig(),
         output_audio_transcription=types.AudioTranscriptionConfig(),
         system_instruction=types.Content(parts=[types.Part(text=instr)]),
         tools=[escalate_tool],
     )
+
+
+def _is_recoverable_ws_error(exc: Exception) -> bool:
+    """Return True when a Live WebSocket drop (e.g. client inactivity 1008, GoAway, ping timeout) should silently reconnect."""
+    msg = str(exc).lower()
+    fatal_tokens = (
+        "quota",
+        "resource_exhausted",
+        "429",
+        "api key",
+        "api_key",
+        "permission",
+        "403",
+        "401",
+        "not found",
+        "invalid argument",
+        "1007",
+    )
+    if any(tok in msg for tok in fatal_tokens):
+        return False
+    if isinstance(exc, (ConnectionResetError, BrokenPipeError, EOFError, OSError)):
+        return True
+    cls_name = type(exc).__name__.lower()
+    if "connectionclosed" in cls_name or "websocket" in cls_name:
+        return True
+    recoverable_tokens = (
+        "inactivity",
+        "connection closed",
+        "going away",
+        "keepalive",
+        "1000",
+        "1001",
+        "1006",
+        "1008",
+        "1011",
+        "1012",
+        "1013",
+    )
+    return any(tok in msg for tok in recoverable_tokens)
 
 
 async def receive_and_stream_turn(
@@ -255,6 +300,7 @@ async def receive_and_stream_turn(
     t0: float,
     *,
     wait_reply: bool = False,
+    session_state: dict | None = None,
 ) -> tuple[str, str, str | None, str | None, bool, float | None]:
     """Receive one Live API turn and stream 24kHz PCM directly to StackChan on first audio byte."""
     user_tx: list[str] = []
@@ -270,6 +316,14 @@ async def receive_and_stream_turn(
 
     try:
         async for msg in session.receive():
+            sru = getattr(msg, "session_resumption_update", None)
+            if sru and getattr(sru, "resumable", False) and getattr(sru, "new_handle", None):
+                if session_state is not None:
+                    session_state["resumption_handle"] = sru.new_handle
+            if getattr(msg, "go_away", None) is not None:
+                if session_state is not None:
+                    session_state["go_away"] = True
+
             sc = getattr(msg, "server_content", None)
             if sc:
                 if getattr(sc, "input_transcription", None) and sc.input_transcription.text:
@@ -286,6 +340,8 @@ async def receive_and_stream_turn(
                                 stream_id = f"live_{uuid.uuid4().hex[:12]}.wav"
                                 stream_q = register_live_stream(stream_id, sample_rate=24000)
                                 stream_q.put(inline.data)
+                                if session_state is not None:
+                                    session_state["turn_streamed"] = True
                                 url = audio_url(config.mac_ip, live_port, f"live/{stream_id}")
                                 play_task = asyncio.create_task(
                                     asyncio.to_thread(trigger_stream_play, device, url, "happy", wait_reply=wait_reply)
@@ -323,7 +379,7 @@ async def receive_and_stream_turn(
     return "".join(user_tx).strip(), "".join(bot_tx).strip(), escalated_task, tool_call_id, end_requested, ttfa
 
 
-async def run_live_loop(args: argparse.Namespace, active_lang: str) -> int:
+async def run_live_loop(args: argparse.Namespace, active_lang: str, run_state: dict) -> int:
     config = load_config()
     api_key = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
     if not api_key:
@@ -356,224 +412,318 @@ async def run_live_loop(args: argparse.Namespace, active_lang: str) -> int:
         active_voice = args.voice.strip()
 
     first_connect = True
+    voice_switched = False
+    resumption_handle: str | None = None
+    pending_audio: tuple[bytes, int] | None = None
+    consecutive_reconnect_failures = 0
     turn = 0
-    while turn < args.max_turns:
-        live_cfg = build_live_config(active_voice, lang=active_lang, context=args.context if first_connect else "")
-        will_greet = (not args.no_greeting) or (not first_connect)
 
-        if not will_greet:
+    while turn < args.max_turns:
+        live_cfg = build_live_config(
+            active_voice,
+            lang=active_lang,
+            context=args.context if first_connect else "",
+            resumption_handle=resumption_handle,
+        )
+        will_greet = (first_connect and not args.no_greeting) or voice_switched
+
+        if not will_greet and first_connect:
             with suppress(Exception):
                 device.set_agent_mode("live", label=f"LIVE {active_voice}")
                 device.set_face("calm")
 
+        resume_tag = ", resuming" if resumption_handle else ""
         print(
-            f"[stackchan_live] Connecting to {args.model} (voice={active_voice}, lang={active_lang}, port={live_port})...",
+            f"[stackchan_live] Connecting to {args.model} (voice={active_voice}, lang={active_lang}, port={live_port}{resume_tag})...",
             flush=True,
         )
 
         voice_changed_to = ""
-        async with genai_client.aio.live.connect(model=args.model, config=live_cfg) as session:
-            print(f"[stackchan_live] Connected! LIVE 3.8 ({active_voice}) streaming session active.", flush=True)
+        reconnect_needed = False
+        session_state: dict = {"resumption_handle": resumption_handle, "go_away": False, "turn_streamed": False}
 
-            if will_greet:
-                if first_connect:
-                    greet_prompt = (
-                        f"Saluda en una frase muy corta en español diciendo que ya estás listo en modo Gemini Live con la voz {active_voice}."
-                        if active_lang == "es"
-                        else f"Greet the user in one very short sentence in '{active_lang}' saying Gemini Live is ready with voice {active_voice}."
-                    )
+        try:
+            async with genai_client.aio.live.connect(model=args.model, config=live_cfg) as session:
+                consecutive_reconnect_failures = 0
+                if first_connect or voice_switched:
+                    print(f"[stackchan_live] Connected! LIVE 3.8 ({active_voice}) streaming session active.", flush=True)
                 else:
-                    greet_prompt = (
-                        f"Di en una frase muy corta en español: Listo, cambié a la voz {active_voice}."
-                        if active_lang == "es"
-                        else f"Say in one very short sentence in '{active_lang}': Switched to voice {active_voice}."
+                    print(f"[stackchan_live] Reconnected silently to LIVE 3.8 ({active_voice}).", flush=True)
+
+                if will_greet:
+                    if first_connect:
+                        greet_prompt = (
+                            f"Saluda en una frase muy corta en español diciendo que ya estás listo en modo Gemini Live con la voz {active_voice}."
+                            if active_lang == "es"
+                            else f"Greet the user in one very short sentence in '{active_lang}' saying Gemini Live is ready with voice {active_voice}."
+                        )
+                    else:
+                        greet_prompt = (
+                            f"Di en una frase muy corta en español: Listo, cambié a la voz {active_voice}."
+                            if active_lang == "es"
+                            else f"Say in one very short sentence in '{active_lang}': Switched to voice {active_voice}."
+                        )
+                    t0 = time.monotonic()
+                    await session.send_client_content(
+                        turns=types.Content(role="user", parts=[types.Part(text=greet_prompt)]),
+                        turn_complete=True,
                     )
-                t0 = time.monotonic()
-                await session.send_client_content(
-                    turns=types.Content(role="user", parts=[types.Part(text=greet_prompt)]),
-                    turn_complete=True,
-                )
-                _heard, spoken, _esc, _tcid, _end, ttfa = await asyncio.wait_for(
-                    receive_and_stream_turn(session, device, config, live_port, t0), timeout=25.0
-                )
-                with suppress(Exception):
-                    device.set_agent_mode("live", label=f"LIVE {active_voice}")
-                    device.set_face("calm")
-                if spoken:
-                    ttfa_s = f"{ttfa:.2f}s" if ttfa is not None else "n/a"
-                    print(f"[Greeting (TTFA={ttfa_s})] {spoken}", flush=True)
-            first_connect = False
-
-            while turn < args.max_turns:
-                wav_bytes, dev_voice = await asyncio.to_thread(
-                    listen_for_wav,
-                    device,
-                    args.listen_timeout,
-                    active_voice if follow_device_voice else "",
-                )
-                if follow_device_voice and dev_voice and dev_voice != active_voice:
-                    print(f"[stackchan_live] Voice changed on device: {active_voice} -> {dev_voice}", flush=True)
-                    voice_changed_to = dev_voice
-                    break
-                if not wav_bytes:
-                    continue
-
-                pcm_in, sample_rate = wav_bytes_to_pcm16(wav_bytes)
-                if not pcm_in:
+                    _heard, spoken, _esc, _tcid, _end, ttfa = await asyncio.wait_for(
+                        receive_and_stream_turn(
+                            session, device, config, live_port, t0, session_state=session_state
+                        ),
+                        timeout=25.0,
+                    )
+                    resumption_handle = session_state.get("resumption_handle") or resumption_handle
                     with suppress(Exception):
-                        device.resume_listen()
-                    continue
-
-                turn += 1
-                with suppress(Exception):
-                    device.set_face("thinking")
-
-                t0 = time.monotonic()
-                await session.send_realtime_input(activity_start=types.ActivityStart())
-                chunk_bytes = max(3200, int(sample_rate * 2 * 0.1))  # 100ms PCM16 chunks
-                for offset in range(0, len(pcm_in), chunk_bytes):
-                    await session.send_realtime_input(
-                        audio=types.Blob(data=pcm_in[offset : offset + chunk_bytes], mime_type=f"audio/pcm;rate={sample_rate}")
-                    )
-                await session.send_realtime_input(activity_end=types.ActivityEnd())
-
-                try:
-                    heard, spoken, escalated_task, tool_call_id, end_requested, ttfa = await asyncio.wait_for(
-                        receive_and_stream_turn(session, device, config, live_port, t0), timeout=30.0
-                    )
-                except asyncio.TimeoutError:
-                    print(f"[stackchan_live] Turn {turn} timed out waiting for Gemini Live; resuming listen.", flush=True)
-                    with suppress(Exception):
+                        device.set_agent_mode("live", label=f"LIVE {active_voice}")
                         device.set_face("calm")
-                        device.resume_listen()
-                    continue
+                    if spoken:
+                        run_state["greeted"] = True
+                        ttfa_s = f"{ttfa:.2f}s" if ttfa is not None else "n/a"
+                        print(f"[Greeting (TTFA={ttfa_s})] {spoken}", flush=True)
+                first_connect = False
+                voice_switched = False
 
-                total = time.monotonic() - t0
-                ttfa_s = f"{ttfa:.2f}s" if ttfa is not None else "n/a"
-                if heard:
-                    print(f"[Turn {turn} User] {heard}", flush=True)
-                if spoken:
-                    print(f"[Turn {turn} Bot (TTFA={ttfa_s}, total={total:.2f}s)] {spoken}", flush=True)
+                while turn < args.max_turns:
+                    if pending_audio is not None:
+                        pcm_in, sample_rate = pending_audio
+                        pending_audio = None
+                    else:
+                        wav_bytes, dev_voice = await asyncio.to_thread(
+                            listen_for_wav,
+                            device,
+                            args.listen_timeout,
+                            active_voice if follow_device_voice else "",
+                        )
+                        if follow_device_voice and dev_voice and dev_voice != active_voice:
+                            print(f"[stackchan_live] Voice changed on device: {active_voice} -> {dev_voice}", flush=True)
+                            voice_changed_to = dev_voice
+                            break
+                        if not wav_bytes:
+                            continue
 
-                if escalated_task:
-                    handoff_msg = (
-                        "Paso la orden al ingeniero principal."
-                        if active_lang == "es"
-                        else "Handing this over to the lead engineer."
-                    )
-                    if not spoken:
-                        spoke_live = False
-                        try:
-                            if tool_call_id:
-                                await session.send_tool_response(
-                                    function_responses=[
-                                        types.FunctionResponse(
-                                            id=tool_call_id,
-                                            name="escalate_to_engineer",
-                                            response={"status": "ok"},
-                                        )
-                                    ]
-                                )
-                            say_prompt = (
-                                f"Di exactamente esta frase corta en español y nada más: {handoff_msg}"
-                                if active_lang == "es"
-                                else f"Say ONLY this exact short sentence and nothing else: {handoff_msg}"
-                            )
-                            await session.send_client_content(
-                                turns=types.Content(role="user", parts=[types.Part(text=say_prompt)]),
-                                turn_complete=True,
-                            )
-                            _h2, s2, _e2, _id2, _end2, ttfa2 = await asyncio.wait_for(
-                                receive_and_stream_turn(session, device, config, live_port, time.monotonic(), wait_reply=True),
-                                timeout=12.0,
-                            )
-                            spoke_live = bool(s2 or ttfa2 is not None)
-                        except Exception:
-                            spoke_live = False
-                        if not spoke_live:
-                            await asyncio.to_thread(
-                                speak_local_phrase,
-                                device,
-                                config,
-                                live_port,
-                                handoff_msg,
-                                active_lang,
-                                "thinking",
-                                wait_reply=True,
-                            )
+                        pcm_in, sample_rate = wav_bytes_to_pcm16(wav_bytes)
+                        if not pcm_in:
+                            with suppress(Exception):
+                                device.resume_listen()
+                            continue
+
                     with suppress(Exception):
-                        device.set_agent_mode("engineer")
                         device.set_face("thinking")
-                    print(f"[Last User ({active_lang})] {heard}", flush=True)
-                    print(f"[ESCALATED] Task: {escalated_task}", flush=True)
-                    return 0
 
-                if end_requested:
-                    bye_msg = (
-                        "Listo, cerramos la charla. ¡Hasta luego!"
-                        if active_lang == "es"
-                        else "Alright, ending the chat. See you later!"
-                    )
-                    if not spoken:
-                        spoke_live = False
-                        try:
-                            if tool_call_id:
-                                await session.send_tool_response(
-                                    function_responses=[
-                                        types.FunctionResponse(
-                                            id=tool_call_id,
-                                            name="end_chat",
-                                            response={"status": "ok"},
-                                        )
-                                    ]
+                    t0 = time.monotonic()
+                    session_state["turn_streamed"] = False
+                    try:
+                        await session.send_realtime_input(activity_start=types.ActivityStart())
+                        chunk_bytes = max(3200, int(sample_rate * 2 * 0.1))  # 100ms PCM16 chunks
+                        for offset in range(0, len(pcm_in), chunk_bytes):
+                            await session.send_realtime_input(
+                                audio=types.Blob(
+                                    data=pcm_in[offset : offset + chunk_bytes],
+                                    mime_type=f"audio/pcm;rate={sample_rate}",
                                 )
-                            say_prompt = (
-                                f"Di exactamente esta frase corta en español y nada más: {bye_msg}"
-                                if active_lang == "es"
-                                else f"Say ONLY this exact short sentence and nothing else: {bye_msg}"
                             )
-                            await session.send_client_content(
-                                turns=types.Content(role="user", parts=[types.Part(text=say_prompt)]),
-                                turn_complete=True,
+                        await session.send_realtime_input(activity_end=types.ActivityEnd())
+
+                        heard, spoken, escalated_task, tool_call_id, end_requested, ttfa = await asyncio.wait_for(
+                            receive_and_stream_turn(
+                                session, device, config, live_port, t0, session_state=session_state
+                            ),
+                            timeout=30.0,
+                        )
+                    except asyncio.TimeoutError:
+                        print(
+                            f"[stackchan_live] Turn {turn + 1} timed out waiting for Gemini Live; resuming listen.",
+                            flush=True,
+                        )
+                        with suppress(Exception):
+                            device.set_face("calm")
+                            device.resume_listen()
+                        continue
+                    except Exception as exc:
+                        if _is_recoverable_ws_error(exc):
+                            print(
+                                f"[stackchan_live] Session disconnected ({exc}); reconnecting silently to {args.model}...",
+                                flush=True,
                             )
-                            _h2, s2, _e2, _id2, _end2, ttfa2 = await asyncio.wait_for(
-                                receive_and_stream_turn(session, device, config, live_port, time.monotonic(), wait_reply=False),
-                                timeout=12.0,
-                            )
-                            spoke_live = bool(s2 or ttfa2 is not None)
-                        except Exception:
+                            if not session_state.get("turn_streamed"):
+                                pending_audio = (pcm_in, sample_rate)
+                            resumption_handle = session_state.get("resumption_handle") or resumption_handle
+                            reconnect_needed = True
+                            break
+                        raise
+
+                    turn += 1
+                    resumption_handle = session_state.get("resumption_handle") or resumption_handle
+
+                    total = time.monotonic() - t0
+                    ttfa_s = f"{ttfa:.2f}s" if ttfa is not None else "n/a"
+                    if heard:
+                        print(f"[Turn {turn} User] {heard}", flush=True)
+                    if spoken:
+                        print(f"[Turn {turn} Bot (TTFA={ttfa_s}, total={total:.2f}s)] {spoken}", flush=True)
+
+                    if escalated_task:
+                        handoff_msg = (
+                            "Paso la orden al ingeniero principal."
+                            if active_lang == "es"
+                            else "Handing this over to the lead engineer."
+                        )
+                        if not spoken:
                             spoke_live = False
-                        if not spoke_live:
-                            await asyncio.to_thread(
-                                speak_local_phrase,
-                                device,
-                                config,
-                                live_port,
-                                bye_msg,
-                                active_lang,
-                                "calm",
-                                wait_reply=False,
-                            )
-                    with suppress(Exception):
-                        device.set_agent_mode("idle")
-                        device.set_face("calm")
-                    print("[stackchan_live] Session ended by user.", flush=True)
-                    return 0
+                            try:
+                                if tool_call_id:
+                                    await session.send_tool_response(
+                                        function_responses=[
+                                            types.FunctionResponse(
+                                                id=tool_call_id,
+                                                name="escalate_to_engineer",
+                                                response={"status": "ok"},
+                                            )
+                                        ]
+                                    )
+                                say_prompt = (
+                                    f"Di exactamente esta frase corta en español y nada más: {handoff_msg}"
+                                    if active_lang == "es"
+                                    else f"Say ONLY this exact short sentence and nothing else: {handoff_msg}"
+                                )
+                                await session.send_client_content(
+                                    turns=types.Content(role="user", parts=[types.Part(text=say_prompt)]),
+                                    turn_complete=True,
+                                )
+                                _h2, s2, _e2, _id2, _end2, ttfa2 = await asyncio.wait_for(
+                                    receive_and_stream_turn(
+                                        session, device, config, live_port, time.monotonic(), wait_reply=True
+                                    ),
+                                    timeout=12.0,
+                                )
+                                spoke_live = bool(s2 or ttfa2 is not None)
+                            except Exception:
+                                spoke_live = False
+                            if not spoke_live:
+                                await asyncio.to_thread(
+                                    speak_local_phrase,
+                                    device,
+                                    config,
+                                    live_port,
+                                    handoff_msg,
+                                    active_lang,
+                                    "thinking",
+                                    wait_reply=True,
+                                )
+                        with suppress(Exception):
+                            device.set_agent_mode("engineer")
+                            device.set_face("thinking")
+                        print(f"[Last User ({active_lang})] {heard}", flush=True)
+                        print(f"[ESCALATED] Task: {escalated_task}", flush=True)
+                        return 0
+
+                    if end_requested:
+                        bye_msg = (
+                            "Listo, cerramos la charla. ¡Hasta luego!"
+                            if active_lang == "es"
+                            else "Alright, ending the chat. See you later!"
+                        )
+                        if not spoken:
+                            spoke_live = False
+                            try:
+                                if tool_call_id:
+                                    await session.send_tool_response(
+                                        function_responses=[
+                                            types.FunctionResponse(
+                                                id=tool_call_id,
+                                                name="end_chat",
+                                                response={"status": "ok"},
+                                            )
+                                        ]
+                                    )
+                                say_prompt = (
+                                    f"Di exactamente esta frase corta en español y nada más: {bye_msg}"
+                                    if active_lang == "es"
+                                    else f"Say ONLY this exact short sentence and nothing else: {bye_msg}"
+                                )
+                                await session.send_client_content(
+                                    turns=types.Content(role="user", parts=[types.Part(text=say_prompt)]),
+                                    turn_complete=True,
+                                )
+                                _h2, s2, _e2, _id2, _end2, ttfa2 = await asyncio.wait_for(
+                                    receive_and_stream_turn(
+                                        session, device, config, live_port, time.monotonic(), wait_reply=False
+                                    ),
+                                    timeout=12.0,
+                                )
+                                spoke_live = bool(s2 or ttfa2 is not None)
+                            except Exception:
+                                spoke_live = False
+                            if not spoke_live:
+                                await asyncio.to_thread(
+                                    speak_local_phrase,
+                                    device,
+                                    config,
+                                    live_port,
+                                    bye_msg,
+                                    active_lang,
+                                    "calm",
+                                    wait_reply=False,
+                                )
+                        with suppress(Exception):
+                            device.set_agent_mode("idle")
+                            device.set_face("calm")
+                        print("[stackchan_live] Session ended by user.", flush=True)
+                        return 0
+
+                    if session_state.get("go_away"):
+                        print("[stackchan_live] Server sent GoAway; reconnecting silently...", flush=True)
+                        reconnect_needed = True
+                        break
+        except Exception as exc:
+            if not first_connect and resumption_handle is not None and _is_recoverable_ws_error(exc):
+                print(
+                    f"[stackchan_live] Resumption handle rejected ({exc}); retrying with fresh Live session...",
+                    flush=True,
+                )
+                resumption_handle = None
+                consecutive_reconnect_failures += 1
+                if consecutive_reconnect_failures <= 3:
+                    await asyncio.sleep(0.3)
+                    continue
+            if not first_connect and _is_recoverable_ws_error(exc):
+                consecutive_reconnect_failures += 1
+                if consecutive_reconnect_failures <= 3:
+                    print(
+                        f"[stackchan_live] Reconnect attempt {consecutive_reconnect_failures}/3 after ({exc})...",
+                        flush=True,
+                    )
+                    await asyncio.sleep(0.5 * consecutive_reconnect_failures)
+                    continue
+            raise
 
         if voice_changed_to:
             active_voice = voice_changed_to
+            voice_switched = True
+            resumption_handle = None
+            continue
+        if reconnect_needed:
+            await asyncio.sleep(0.15)
             continue
         break
 
     return 0
 
 
-def run_fallback_chat(args: argparse.Namespace, active_lang: str, reason: str) -> int:
+def run_fallback_chat(
+    args: argparse.Namespace,
+    active_lang: str,
+    reason: str,
+    *,
+    already_greeted: bool = False,
+) -> int:
     """Seamlessly hand off to stackchan_chat.py (FREE 3.5 LITE) if Gemini Live fails."""
     print(f"[stackchan_live] Falling back to stackchan_chat.py (FREE 3.5 LITE): {reason}", flush=True)
     fallback_script = Path(__file__).resolve().with_name("stackchan_chat.py")
     cmd = [sys.executable, "-u", str(fallback_script), "--lang", active_lang]
-    if args.no_greeting:
+    if args.no_greeting or already_greeted:
         cmd.append("--no-greeting")
     if args.context:
         cmd.extend(["--context", args.context])
@@ -597,14 +747,15 @@ def main() -> None:
     raw_lang = args.lang.strip().lower()
     active_lang = detect_os_language() if raw_lang in ("", "auto", "os") else raw_lang.split("-")[0]
 
+    run_state = {"greeted": False}
     try:
-        rc = asyncio.run(run_live_loop(args, active_lang))
+        rc = asyncio.run(run_live_loop(args, active_lang, run_state))
     except Exception as exc:
         if args.no_fallback:
             print(f"[stackchan_live] Live session error ({exc}).", flush=True)
             rc = 1
         else:
-            rc = run_fallback_chat(args, active_lang, str(exc))
+            rc = run_fallback_chat(args, active_lang, str(exc), already_greeted=run_state["greeted"])
     sys.exit(rc)
 
 
