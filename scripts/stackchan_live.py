@@ -253,11 +253,14 @@ async def receive_and_stream_turn(
     config,
     live_port: int,
     t0: float,
-) -> tuple[str, str, str | None, bool, float | None]:
+    *,
+    wait_reply: bool = False,
+) -> tuple[str, str, str | None, str | None, bool, float | None]:
     """Receive one Live API turn and stream 24kHz PCM directly to StackChan on first audio byte."""
     user_tx: list[str] = []
     bot_tx: list[str] = []
     escalated_task: str | None = None
+    tool_call_id: str | None = None
     end_requested = False
 
     stream_id: str | None = None
@@ -285,7 +288,7 @@ async def receive_and_stream_turn(
                                 stream_q.put(inline.data)
                                 url = audio_url(config.mac_ip, live_port, f"live/{stream_id}")
                                 play_task = asyncio.create_task(
-                                    asyncio.to_thread(trigger_stream_play, device, url, "happy")
+                                    asyncio.to_thread(trigger_stream_play, device, url, "happy", wait_reply=wait_reply)
                                 )
                             else:
                                 stream_q.put(inline.data)
@@ -297,9 +300,11 @@ async def receive_and_stream_turn(
                 for fc in tc.function_calls:
                     if fc.name == "escalate_to_engineer":
                         escalated_task = (fc.args or {}).get("task", "User requested technical assistance")
+                        tool_call_id = getattr(fc, "id", None)
                         break
                     if fc.name == "end_chat":
                         end_requested = True
+                        tool_call_id = getattr(fc, "id", None)
                         break
                 if escalated_task or end_requested:
                     break
@@ -315,7 +320,7 @@ async def receive_and_stream_turn(
     if stream_id is not None:
         unregister_live_stream(stream_id)
 
-    return "".join(user_tx).strip(), "".join(bot_tx).strip(), escalated_task, end_requested, ttfa
+    return "".join(user_tx).strip(), "".join(bot_tx).strip(), escalated_task, tool_call_id, end_requested, ttfa
 
 
 async def run_live_loop(args: argparse.Namespace, active_lang: str) -> int:
@@ -386,7 +391,7 @@ async def run_live_loop(args: argparse.Namespace, active_lang: str) -> int:
                     turns=types.Content(role="user", parts=[types.Part(text=greet_prompt)]),
                     turn_complete=True,
                 )
-                _heard, spoken, _esc, _end, ttfa = await asyncio.wait_for(
+                _heard, spoken, _esc, _tcid, _end, ttfa = await asyncio.wait_for(
                     receive_and_stream_turn(session, device, config, live_port, t0), timeout=25.0
                 )
                 if spoken:
@@ -428,7 +433,7 @@ async def run_live_loop(args: argparse.Namespace, active_lang: str) -> int:
                 await session.send_realtime_input(activity_end=types.ActivityEnd())
 
                 try:
-                    heard, spoken, escalated_task, end_requested, ttfa = await asyncio.wait_for(
+                    heard, spoken, escalated_task, tool_call_id, end_requested, ttfa = await asyncio.wait_for(
                         receive_and_stream_turn(session, device, config, live_port, t0), timeout=30.0
                     )
                 except asyncio.TimeoutError:
@@ -451,16 +456,32 @@ async def run_live_loop(args: argparse.Namespace, active_lang: str) -> int:
                         if active_lang == "es"
                         else "Handing this over to the lead engineer."
                     )
-                    await asyncio.to_thread(
-                        speak_local_phrase,
-                        device,
-                        config,
-                        live_port,
-                        handoff_msg,
-                        active_lang,
-                        "thinking",
-                        wait_reply=True,
-                    )
+                    if not spoken:
+                        try:
+                            await session.send_tool_response(
+                                function_responses=[
+                                    types.FunctionResponse(
+                                        id=tool_call_id,
+                                        name="escalate_to_engineer",
+                                        response={"say_now": handoff_msg},
+                                    )
+                                ]
+                            )
+                            await asyncio.wait_for(
+                                receive_and_stream_turn(session, device, config, live_port, time.monotonic(), wait_reply=True),
+                                timeout=12.0,
+                            )
+                        except Exception:
+                            await asyncio.to_thread(
+                                speak_local_phrase,
+                                device,
+                                config,
+                                live_port,
+                                handoff_msg,
+                                active_lang,
+                                "thinking",
+                                wait_reply=True,
+                            )
                     with suppress(Exception):
                         device.set_agent_mode("engineer")
                         device.set_face("thinking")
@@ -474,18 +495,35 @@ async def run_live_loop(args: argparse.Namespace, active_lang: str) -> int:
                         if active_lang == "es"
                         else "Alright, ending the chat. See you later!"
                     )
+                    if not spoken:
+                        try:
+                            await session.send_tool_response(
+                                function_responses=[
+                                    types.FunctionResponse(
+                                        id=tool_call_id,
+                                        name="end_chat",
+                                        response={"say_now": bye_msg},
+                                    )
+                                ]
+                            )
+                            await asyncio.wait_for(
+                                receive_and_stream_turn(session, device, config, live_port, time.monotonic(), wait_reply=False),
+                                timeout=12.0,
+                            )
+                        except Exception:
+                            await asyncio.to_thread(
+                                speak_local_phrase,
+                                device,
+                                config,
+                                live_port,
+                                bye_msg,
+                                active_lang,
+                                "calm",
+                                wait_reply=False,
+                            )
                     with suppress(Exception):
                         device.set_agent_mode("idle")
-                    await asyncio.to_thread(
-                        speak_local_phrase,
-                        device,
-                        config,
-                        live_port,
-                        bye_msg,
-                        active_lang,
-                        "calm",
-                        wait_reply=False,
-                    )
+                        device.set_face("calm")
                     print("[stackchan_live] Session ended by user.", flush=True)
                     return 0
 
