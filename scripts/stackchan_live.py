@@ -31,6 +31,7 @@ sys.path.insert(0, str(ROOT))
 from google import genai  # noqa: E402
 from google.genai import types  # noqa: E402
 
+from mcp_server import audio_processing  # noqa: E402
 from mcp_server.audio_server import (  # noqa: E402
     AUDIO_DIR,
     audio_url,
@@ -114,14 +115,20 @@ def wait_for_playback_end(
         time.sleep(0.04)
 
 
-def trigger_stream_play(client: StackchanClient, url: str, face: str = "happy") -> int | None:
+def trigger_stream_play(
+    client: StackchanClient,
+    url: str,
+    face: str = "happy",
+    *,
+    wait_reply: bool = False,
+) -> int | None:
     """Tell StackChan to start streaming the live WAV URL immediately."""
     with suppress(Exception):
         client.set_face(face)
     baseline_started_ms = read_started_ms(client)
     for attempt in range(1, 3):
         try:
-            res = client.play(url)
+            res = client.play(url, wait_reply=wait_reply)
             if res.get("success", True):
                 return baseline_started_ms
             print(f"[stackchan_live] Play attempt {attempt}/2 failed: {res}", flush=True)
@@ -129,6 +136,36 @@ def trigger_stream_play(client: StackchanClient, url: str, face: str = "happy") 
             print(f"[stackchan_live] Play attempt {attempt}/2 error: {exc}", flush=True)
         time.sleep(0.25)
     return baseline_started_ms
+
+
+def speak_local_phrase(
+    client: StackchanClient,
+    config,
+    live_port: int,
+    text: str,
+    lang: str,
+    face: str = "calm",
+    *,
+    wait_reply: bool = False,
+) -> None:
+    """Speak a short handoff/goodbye phrase via local TTS over the dedicated live_port."""
+    try:
+        wav_path = audio_processing.generate_tts(text, lang, config)
+    except Exception as exc:
+        print(f"[stackchan_live] Local TTS error ({lang}): {exc}", flush=True)
+        return
+    stream_id = f"handoff_{uuid.uuid4().hex[:10]}.wav"
+    try:
+        pcm, sr = wav_bytes_to_pcm16(wav_path.read_bytes())
+        q = register_live_stream(stream_id, sample_rate=sr)
+        q.put(pcm)
+        q.put(None)
+        url = audio_url(config.mac_ip, live_port, f"live/{stream_id}")
+        baseline = trigger_stream_play(client, url, face=face, wait_reply=wait_reply)
+        wait_for_playback_end(client, timeout_sec=15.0, baseline_started_ms=baseline)
+    finally:
+        wav_path.unlink(missing_ok=True)
+        unregister_live_stream(stream_id)
 
 
 def listen_for_wav(
@@ -409,6 +446,21 @@ async def run_live_loop(args: argparse.Namespace, active_lang: str) -> int:
                     print(f"[Turn {turn} Bot (TTFA={ttfa_s}, total={total:.2f}s)] {spoken}", flush=True)
 
                 if escalated_task:
+                    handoff_msg = (
+                        "Paso la orden al ingeniero principal."
+                        if active_lang == "es"
+                        else "Handing this over to the lead engineer."
+                    )
+                    await asyncio.to_thread(
+                        speak_local_phrase,
+                        device,
+                        config,
+                        live_port,
+                        handoff_msg,
+                        active_lang,
+                        "thinking",
+                        wait_reply=True,
+                    )
                     with suppress(Exception):
                         device.set_agent_mode("engineer")
                         device.set_face("thinking")
@@ -417,9 +469,23 @@ async def run_live_loop(args: argparse.Namespace, active_lang: str) -> int:
                     return 0
 
                 if end_requested:
+                    bye_msg = (
+                        "Listo, cerramos la charla. ¡Hasta luego!"
+                        if active_lang == "es"
+                        else "Alright, ending the chat. See you later!"
+                    )
                     with suppress(Exception):
                         device.set_agent_mode("idle")
-                        device.set_face("calm")
+                    await asyncio.to_thread(
+                        speak_local_phrase,
+                        device,
+                        config,
+                        live_port,
+                        bye_msg,
+                        active_lang,
+                        "calm",
+                        wait_reply=False,
+                    )
                     print("[stackchan_live] Session ended by user.", flush=True)
                     return 0
 
