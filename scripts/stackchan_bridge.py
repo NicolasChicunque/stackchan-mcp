@@ -190,11 +190,15 @@ def main() -> None:
                 if esc.get("ready"):
                     task = (esc.get("task") or "User requested technical assistance").strip()
                     user_txt = (esc.get("user_text") or "").strip()
+                    prev_u = (esc.get("prev_user") or "").strip()
+                    prev_b = (esc.get("prev_bot") or "").strip()
                     keep_lease_on_exit = True
                     # Extend lease so robot stays in AGENT $ while Antigravity processes the task
                     attach_lease(client, mode="engineer", ttl_ms=60000)
+                    if prev_u or prev_b:
+                        print(f"\n[Prev Turn] User: {prev_u} | StackChan: {prev_b}", flush=True)
                     if user_txt:
-                        print(f"\n[Last User ({args.lang})] {user_txt}", flush=True)
+                        print(f"[Last User ({args.lang})] {user_txt}", flush=True)
                     print(f"[ESCALATED] Task: {task}", flush=True)
                     return
             except Exception:
