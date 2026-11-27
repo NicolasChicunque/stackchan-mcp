@@ -102,7 +102,7 @@ Restart Antigravity, open **`GEMINI`** on StackChan, and type **`/stackchanchat`
 
 ## About & Support
 
-Built as a **personal hobby** using personal resources and **AI-assisted development (vibe coding)**, shared freely for the StackChan community. Issues and PRs are welcome!
+Built as a **personal hobby** using personal resources and **AI-assisted development (vibe coding)**, shared freely for the StackChan community. This is an **unofficial community fork**, provided as-is under the [MIT License](LICENSE) with no affiliation to M5Stack. Issues and PRs are welcome!
 
 <!-- DRAFT SUPPORT LINKS — Uncomment once accounts are created:
 If you enjoy this project and want to support ongoing hobby development:
