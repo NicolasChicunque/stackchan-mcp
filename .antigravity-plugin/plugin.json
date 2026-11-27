@@ -1,0 +1,15 @@
+{
+  "name": "stackchan-mcp",
+  "displayName": "StackChan MCP Voice Bridge",
+  "version": "1.4.0",
+  "description": "Hands-free voice conversation loop (/stackchanchat) and MCP robot tools connecting M5Stack StackChan Community Suite (CoreS3) to Antigravity IDE.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "/stackchanchat",
+    "Check StackChan status and nod hello.",
+    "Look around with StackChan's camera and describe what you see."
+  ],
+  "author": {
+    "name": "NicolasChicunque"
+  }
+}
